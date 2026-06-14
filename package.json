@@ -1,15 +1,15 @@
 {
-    "name": "mcp-searxng",
-    "version": "1.5.0",
-    "mcpName": "io.github.ihor-sokoliuk/mcp-searxng",
-    "description": "MCP server for SearXNG integration",
+    "name": "deep-re-searxng",
+    "version": "0.1.0",
+    "mcpName": "local/deep-re-searxng",
+    "description": "SearXNG MCP server bundled with Codex deep research skills",
     "license": "MIT",
-    "author": "Ihor Sokoliuk (https://github.com/ihor-sokoliuk)",
-    "homepage": "https://github.com/ihor-sokoliuk/mcp-searxng",
-    "bugs": "https://github.com/ihor-sokoliuk/mcp-searxng/issues",
+    "author": "LocalT0aster",
+    "homepage": "https://github.com/LocalT0aster/deep-re-searxng",
+    "bugs": "https://github.com/LocalT0aster/deep-re-searxng/issues",
     "repository": {
         "type": "git",
-        "url": "https://github.com/ihor-sokoliuk/mcp-searxng"
+        "url": "https://github.com/LocalT0aster/deep-re-searxng"
     },
     "keywords": [
         "mcp",
@@ -21,11 +21,13 @@
         "ai",
         "pagination",
         "smithery",
-        "url-reader"
+        "url-reader",
+        "deep-research",
+        "codex-skills"
     ],
     "type": "module",
     "bin": {
-        "mcp-searxng": "dist/cli.js"
+        "deep-re-searxng": "dist/cli.js"
     },
     "main": "dist/index.js",
     "files": [

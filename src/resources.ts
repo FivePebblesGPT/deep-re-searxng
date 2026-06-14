@@ -8,7 +8,7 @@ export function createConfigResource() {
 
   const config = {
     serverInfo: {
-      name: "ihor-sokoliuk/mcp-searxng",
+      name: "local/deep-re-searxng",
       version: packageVersion,
       description: "MCP server for SearXNG integration"
     },
@@ -39,7 +39,7 @@ export function createConfigResource() {
 }
 
 export function createHelpResource() {
-  return `# SearXNG MCP Server Help
+  return `# Deep Re SearXNG MCP Server Help
 
 ## Overview
 This is a Model Context Protocol (MCP) server that provides web search, autocomplete suggestions, instance capability discovery, and URL content reading through SearXNG.

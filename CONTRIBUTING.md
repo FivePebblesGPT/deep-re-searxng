@@ -1,53 +1,35 @@
-# Contributing to mcp-searxng
+# Contributing
 
-We welcome contributions! Follow these guidelines to get started.
+Deep Re SearXNG is a local combined distribution of:
 
-Please read and follow the [Code of Conduct](CODE_OF_CONDUCT.md) when participating in this project.
+- a TypeScript SearXNG MCP server
+- repo-scoped Codex Deep Research skills
+- a bundled local Docker Compose runtime
 
-## Getting Started
-
-```bash
-git clone https://github.com/YOUR_USERNAME/mcp-searxng.git
-cd mcp-searxng
-git remote add upstream https://github.com/ihor-sokoliuk/mcp-searxng.git
-npm install
-```
-
-## Development Workflow
+## Development
 
 ```bash
-npm run watch   # Watch mode — rebuilds on file changes
-npm run build   # One-off build
-```
-
-## Coding Standards
-
-- Use TypeScript with strict type safety
-- Follow existing error handling patterns
-- Write concise, informative error messages
-- Include unit tests for new functionality
-- Maintain 80%+ test coverage
-- Test with MCP inspector before submitting
-- Run evals to verify functionality
-
-## Testing
-
-```bash
-npm test                  # Run all tests
-npm run test:coverage     # Generate coverage report
-npm run test:watch        # Watch mode
-```
-
-## Submitting a PR
-
-```bash
-git checkout -b feature/your-feature-name
-# Make changes in src/
+npm ci
+npm run lint
 npm run build
 npm test
-npm run test:coverage
-npm run inspector
-git commit -m "feat: description"
-git push origin feature/your-feature-name
-# Open a PR on GitHub
+docker compose config
 ```
+
+For Python research helpers:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+python scripts/research/validate_json.py --help
+```
+
+Keep the four MCP tool names stable unless a breaking change is intentional:
+
+- `searxng_web_search`
+- `searxng_search_suggestions`
+- `searxng_instance_info`
+- `web_url_read`
+
+When changing skills, keep `SKILL.md` descriptions short and include clear `Use when` trigger language.

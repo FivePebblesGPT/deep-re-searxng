@@ -122,7 +122,7 @@ function getDefaultUrlReadMaxChars(mcpServer: McpServer): number | undefined {
 export function createMcpServer(): McpServer {
   const mcpServer = new McpServer(
     {
-      name: "ihor-sokoliuk/mcp-searxng",
+      name: "local/deep-re-searxng",
       version: packageVersion,
     },
     {
@@ -283,7 +283,7 @@ export function createMcpServer(): McpServer {
           uri: "help://usage-guide",
           mimeType: "text/markdown",
           name: "Usage Guide",
-          description: "How to use the MCP SearXNG server effectively"
+          description: "How to use the Deep Re SearXNG MCP server effectively"
         }
       ]
     };
@@ -371,7 +371,7 @@ export async function main() {
 
     // Show helpful message when running in terminal
     if (process.stdin.isTTY) {
-      console.error(`🔍 MCP SearXNG Server v${packageVersion} - Ready`);
+      console.error(`Deep Re SearXNG MCP Server v${packageVersion} - Ready`);
       if (process.env.SEARXNG_URL) {
         console.error(`🌐 SearXNG URL: ${process.env.SEARXNG_URL}`);
       } else {
@@ -384,7 +384,7 @@ export async function main() {
     await mcpServer.connect(transport);
     
     // Log after connection is established
-    logMessage(mcpServer, "info", `MCP SearXNG Server v${packageVersion} connected via STDIO`);
+    logMessage(mcpServer, "info", `Deep Re SearXNG MCP Server v${packageVersion} connected via STDIO`);
     logMessage(mcpServer, "info", `Log level: ${getCurrentLogLevel()}`);
     logMessage(mcpServer, "info", `Environment: ${process.env.NODE_ENV || 'development'}`);
     logMessage(mcpServer, "info", `SearXNG URL: ${process.env.SEARXNG_URL || 'not configured'}`);

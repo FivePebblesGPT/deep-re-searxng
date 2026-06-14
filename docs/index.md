@@ -1,4 +1,4 @@
-# mcp-searxng Documentation
+# Deep Re SearXNG Documentation
 
 ## User Guides
 

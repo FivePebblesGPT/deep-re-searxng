@@ -1,11 +1,16 @@
 # Changelog
 
-All notable changes to mcp-searxng are documented here.
+All notable changes to deep-re-searxng are documented here.
 Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
 ### Added
+
+- Combined `mcp-searxng` with SearXNG-tailored Codex Deep Research skills.
+- Added bundled local Compose runtime for SearXNG, Valkey, and the MCP HTTP server.
+- Added repo-scoped `.agents/skills` and `.codex` agent/config assets.
+- Added `scripts/research/validate_json.py` and tests for research assets.
 
 - **Configurable URL cache controls:** `CACHE_TTL_MS` sets the URL cache TTL (default `86400000` ms = 24 h) and `CACHE_MAX_ENTRIES` sets the maximum cached URLs (default `500`).
 

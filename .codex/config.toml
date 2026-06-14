@@ -1,0 +1,20 @@
+[mcp_servers.deep_re_searxng]
+url = "http://127.0.0.1:3000/mcp"
+enabled = true
+tool_timeout_sec = 120
+default_tools_approval_mode = "auto"
+enabled_tools = [
+  "searxng_web_search",
+  "searxng_search_suggestions",
+  "searxng_instance_info",
+  "web_url_read",
+]
+
+[agents]
+max_threads = 6
+max_depth = 1
+
+[agents.searxng_researcher]
+description = "Delegated internet researcher that uses the local SearXNG MCP server for search and URL reading."
+config_file = "./agents/searxng-researcher.toml"
+nickname_candidates = ["Archive", "Index", "Scout", "Signal"]

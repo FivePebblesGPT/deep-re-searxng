@@ -2,7 +2,7 @@
 
 ## Our Pledge
 
-We want `mcp-searxng` to be a welcoming, respectful project for everyone who uses, contributes to, or discusses it.
+We want `deep-re-searxng` to be a welcoming, respectful project for everyone who uses, contributes to, or discusses it.
 
 Contributors, maintainers, and community members are expected to treat each other with dignity and care, regardless of age, body size, disability, ethnicity, gender identity or expression, level of experience, nationality, personal appearance, race, religion, sexual identity or orientation, socioeconomic status, or technology choices.
 
@@ -31,7 +31,7 @@ Examples of unacceptable behavior include:
 
 ## Scope
 
-This code of conduct applies in all `mcp-searxng` project spaces, including GitHub issues, pull requests, discussions, documentation, release channels, and community support conversations connected to the project.
+This code of conduct applies in all `deep-re-searxng` project spaces, including GitHub issues, pull requests, discussions, documentation, release channels, and community support conversations connected to the project.
 
 It also applies when someone represents the project in public, for example by speaking on behalf of the project, using official project channels, or presenting project work in a way that affects the community.
 
@@ -68,4 +68,4 @@ Enforcement decisions should be proportional to the severity and impact of the b
 
 ## Attribution
 
-This code of conduct is aligned with the Contributor Covenant model and adapted for the `mcp-searxng` project.
+This code of conduct is aligned with the Contributor Covenant model and adapted for the `deep-re-searxng` project.

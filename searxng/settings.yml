@@ -1,0 +1,16 @@
+use_default_settings: true
+
+server:
+  secret_key: "change-this-local-development-key"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+
+redis:
+  url: redis://valkey:6379/0

@@ -255,7 +255,7 @@ export async function createHttpServer(
   app.get('/health', healthLimiter, (_req, res) => {
     res.json({ 
       status: 'healthy',
-      server: 'ihor-sokoliuk/mcp-searxng',
+      server: 'local/deep-re-searxng',
       version: packageVersion,
       transport: 'http'
     });

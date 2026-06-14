@@ -1,6 +1,6 @@
 # Configuration Reference
 
-All environment variables for `mcp-searxng`, organized by concern. All variables are optional unless marked required.
+All environment variables for `deep-re-searxng`, organized by concern. All variables are optional unless marked required.
 
 ## Core
 
@@ -129,7 +129,7 @@ Complete MCP client configuration with every variable. Mix and match as needed â
   "mcpServers": {
     "searxng": {
       "command": "npx",
-      "args": ["-y", "mcp-searxng"],
+      "args": ["-y", "deep-re-searxng"],
       "env": {
         "SEARXNG_URL": "YOUR_SEARXNG_INSTANCE_URL",
         "SEARXNG_TIMEOUT_MS": "10000",

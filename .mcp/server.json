@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.ihor-sokoliuk/mcp-searxng",
-  "title": "SearXNG Search",
-  "description": "MCP server for SearXNG — privacy-respecting web search with pagination, URL reading",
+  "name": "local/deep-re-searxng",
+  "title": "Deep Re SearXNG",
+  "description": "SearXNG MCP server bundled with Codex deep research skills",
   "repository": {
-    "url": "https://github.com/ihor-sokoliuk/mcp-searxng",
+    "url": "https://github.com/LocalT0aster/deep-re-searxng",
     "source": "github"
   },
-  "version": "1.5.0",
+  "version": "0.1.0",
   "packages": [
     {
       "registryType": "npm",
-      "identifier": "mcp-searxng",
-      "version": "1.5.0",
+      "identifier": "deep-re-searxng",
+      "version": "0.1.0",
       "transport": {
         "type": "stdio"
       },

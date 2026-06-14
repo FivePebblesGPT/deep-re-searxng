@@ -1,0 +1,17 @@
+field_categories:
+  - category: Basic Info
+    fields:
+      - name: name
+        description: Canonical item name
+        detail_level: brief
+        required: true
+      - name: summary
+        description: Short sourced summary
+        detail_level: moderate
+        required: true
+  - category: Evidence
+    fields:
+      - name: sources
+        description: Source URLs used for the result
+        detail_level: brief
+        required: false

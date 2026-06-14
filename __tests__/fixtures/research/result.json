@@ -1,0 +1,10 @@
+{
+  "basic_info": {
+    "name": "Example Item",
+    "summary": "A concise researched summary."
+  },
+  "evidence": {
+    "sources": ["https://example.com/source"]
+  },
+  "uncertain": []
+}

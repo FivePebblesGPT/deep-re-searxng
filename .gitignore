@@ -32,7 +32,6 @@ logs
 *.sln
 *.sw?
 .roo
-.agents
 
 # OS files
 .DS_Store
@@ -40,9 +39,6 @@ Thumbs.db
 
 # Claude
 .claude
-
-# Codex
-.codex
 
 # registry credentials
 .mcpregistry*
