@@ -9,11 +9,13 @@
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import http from 'node:http';
 import { packageVersion } from '../../src/version.js';
 import {
   isWebUrlReadArgs,
-  createMcpServer
+  createMcpServer,
+  createToolAdmissionController,
+  createHttpShutdown,
 } from '../../src/index.js';
 import { isSearXNGWebSearchArgs } from '../../src/types.js';
 import { createConfigResource, createHelpResource } from '../../src/resources.js';
@@ -23,6 +25,31 @@ const results = createTestResults();
 
 async function runTests() {
   console.log('🧪 Integration Testing: index.ts\n');
+
+  await testFunction('repeated HTTP signals share session shutdown before listener closure', async () => {
+    let release!: () => void;
+    let shutdownCalls = 0;
+    let closedCalls = 0;
+    const draining = new Promise<void>(resolve => { release = resolve; });
+    const listener = http.createServer();
+    listener.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => listener.once('listening', resolve));
+    const shutdown = createHttpShutdown({
+      shutdownStateful: () => { shutdownCalls++; return draining; },
+    }, listener, () => { closedCalls++; });
+    try {
+      const first = shutdown('SIGINT');
+      assert.equal(shutdown('SIGTERM'), first);
+      assert.equal(shutdownCalls, 1);
+      assert.equal(listener.listening, true);
+      assert.equal(closedCalls, 0);
+      release();
+      await first;
+      assert.equal(listener.listening, false);
+      assert.equal(closedCalls, 1);
+      assert.equal(shutdown('SIGINT'), first);
+    } finally { release(); listener.close(); }
+  }, results);
 
   await testFunction('Package version is exported', () => {
     assert.ok(packageVersion);
@@ -193,6 +220,20 @@ async function runTests() {
   }, results);
 
   await testFunction('Importing index.ts does not start the CLI server', () => {
+    // When this suite runs under a debugger (e.g. VS Code's JavaScript Debug
+    // Terminal / auto-attach), Node injects the inspector into child processes
+    // and prints banner lines like "Debugger attached." to stderr. That has
+    // nothing to do with the program under test, so:
+    //   1. strip the inspector env vars so the child never attaches, and
+    //   2. filter any residual debugger banner lines from the captured output.
+    const { NODE_OPTIONS: _n, VSCODE_INSPECTOR_OPTIONS: _v, ...cleanEnv } = process.env;
+
+    const stripDebuggerNoise = (output: string): string =>
+      output
+        .split('\n')
+        .filter(line => !/^(Debugger attached\.|Waiting for the debugger to disconnect\.\.\.|Debugger listening on |For help, see: https:\/\/nodejs\.org\/en\/docs\/inspector)/.test(line))
+        .join('\n');
+
     const result = spawnSync(
       process.execPath,
       [
@@ -204,7 +245,7 @@ async function runTests() {
       {
         cwd: process.cwd(),
         env: {
-          ...process.env,
+          ...cleanEnv,
           MCP_HTTP_PORT: '',
           SEARXNG_URL: '',
         },
@@ -214,8 +255,8 @@ async function runTests() {
     );
 
     assert.equal(result.status, 0, `Import process failed: ${result.stderr}`);
-    assert.equal(result.stdout, '');
-    assert.equal(result.stderr, '');
+    assert.equal(stripDebuggerNoise(result.stdout), '');
+    assert.equal(stripDebuggerNoise(result.stderr), '');
   }, results);
 
   await testFunction('Running cli.js responds to MCP initialize', () => {
@@ -227,10 +268,9 @@ async function runTests() {
       params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0.1.0' } },
     }) + '\n';
 
-    const tsxBin = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
     const result = spawnSync(
-      tsxBin,
-      ['src/cli.ts'],
+      process.execPath,
+      ['--import', 'tsx', 'src/cli.ts'],
       {
         cwd: process.cwd(),
         env: { ...process.env, MCP_HTTP_PORT: '', SEARXNG_URL: 'https://test-searx.example.com' },
@@ -247,14 +287,15 @@ async function runTests() {
   }, results);
 
   await testFunction('createMcpServer returns an McpServer instance', () => {
-    const server = createMcpServer();
+    const server = createMcpServer(createToolAdmissionController());
     assert.ok(server, 'should return a truthy value');
     assert.ok(server.server, 'should expose underlying Server via .server');
   }, results);
 
   await testFunction('createMcpServer returns independent instances per call', () => {
-    const server1 = createMcpServer();
-    const server2 = createMcpServer();
+    const controller = createToolAdmissionController();
+    const server1 = createMcpServer(controller);
+    const server2 = createMcpServer(controller);
     assert.notEqual(server1, server2, 'factory should return distinct objects');
     assert.notEqual(server1.server, server2.server, 'underlying servers should differ');
   }, results);

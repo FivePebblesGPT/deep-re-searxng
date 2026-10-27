@@ -5,15 +5,17 @@
  *   const skip = checkSkipConditions();
  *   if (skip) { console.log(skip); process.exit(0); }
  *
- *   const responses = spawnWithMessages([
+ *   const responses = await spawnWithMessages([
  *     { jsonrpc: '2.0', id: 1, method: 'initialize', params: { ... } },
  *     { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { ... } },
  *   ]);
  *   const toolResult = responses[2]; // keyed by id
  */
 
-import { spawnSync } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { request } from 'node:http';
+import { createServer } from 'node:net';
 import path from 'node:path';
 
 const DIST_CLI = path.join(process.cwd(), 'dist', 'cli.js');
@@ -43,43 +45,366 @@ export const INIT_PARAMS = {
 };
 
 /**
- * Spawn the built MCP binary, pipe `messages` as newline-delimited JSON to stdin,
- * and return parsed responses keyed by id.
- *
- * @param messages - Array of JSON-RPC message objects to send
- * @param searxngUrl - SEARXNG_URL to pass to the server (default: LIVE_URL)
- * @param timeoutMs - spawnSync timeout in milliseconds (default: 15000)
+ * Starts the built CLI in HTTP transport mode for local end-to-end tests.
  */
-export function spawnWithMessages(
-  messages: object[],
-  searxngUrl: string = LIVE_URL ?? '',
-  timeoutMs = 15000
-): Record<number, any> {
-  const input = messages.map((m) => JSON.stringify(m)).join('\n') + '\n';
+export interface SpawnedHttpCli {
+  url: URL;
+  health: unknown;
+  close: () => Promise<void>;
+}
 
-  const result = spawnSync('node', [DIST_CLI], {
-    input,
-    env: { ...process.env, SEARXNG_URL: searxngUrl },
-    encoding: 'utf8',
-    timeout: timeoutMs,
-  });
+export interface SpawnHttpCliOptions {
+  stateless?: boolean;
+  readyTimeoutMs?: number;
+  args?: string[];
+  /** @internal Narrow test seam for exercising an EADDRINUSE retry. */
+  reservePort?: () => Promise<number>;
+}
 
-  if (result.error) {
-    throw new Error(`spawnSync failed: ${result.error.message}`);
+interface HttpCliConfig {
+  stateless: boolean;
+  readyTimeoutMs: number;
+  args: string[];
+  reservePort: () => Promise<number>;
+}
+
+interface ChildOutputState {
+  stdout: string;
+  stderr: string;
+  spawnError?: Error;
+}
+
+interface HttpCliAttempt {
+  child: ChildProcess;
+  url: URL;
+  output: ChildOutputState;
+  close: () => Promise<void>;
+}
+
+class HttpCliStartupError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, readonly startupStderr: string, code?: string) {
+    super(message);
+    this.name = 'HttpCliStartupError';
+    this.code = code;
   }
+}
 
-  const responses: Record<number, any> = {};
-  for (const line of result.stdout.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const msg = JSON.parse(trimmed);
-      if (msg.id !== undefined) {
-        responses[msg.id] = msg;
+const MAX_HTTP_CLI_START_ATTEMPTS = 2;
+const MAX_CAPTURED_OUTPUT_CHARS = 64 * 1024;
+const MAX_HEALTH_RESPONSE_CHARS = 16 * 1024;
+
+const CHILD_SYSTEM_ENV_KEYS = new Set([
+  'ComSpec',
+  'COMSPEC',
+  'Path',
+  'PATH',
+  'PATHEXT',
+  'SystemRoot',
+  'SYSTEMROOT',
+  'TEMP',
+  'TMP',
+]);
+
+function createHttpCliEnvironment(port: number, stateless: boolean): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && CHILD_SYSTEM_ENV_KEYS.has(key)) environment[key] = value;
+  }
+  return {
+    ...environment,
+    MCP_HTTP_HOST: '127.0.0.1',
+    MCP_HTTP_PORT: String(port),
+    MCP_HTTP_STATELESS: stateless ? 'true' : 'false',
+    SEARXNG_URL: 'http://127.0.0.1:1',
+  };
+}
+
+function diagnostics(child: ChildProcess, output: ChildOutputState): string {
+  return `exitCode=${child.exitCode}; signalCode=${child.signalCode}; stdout=${JSON.stringify(output.stdout)}; stderr=${JSON.stringify(output.stderr)}`;
+}
+
+function appendOutputTail(current: string, chunk: string): string {
+  return `${current}${chunk}`.slice(-MAX_CAPTURED_OUTPUT_CHARS);
+}
+
+async function reserveLoopbackPort(): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const reservation = createServer();
+    reservation.once('error', reject);
+    reservation.listen(0, '127.0.0.1', () => {
+      const address = reservation.address();
+      if (!address || typeof address === 'string') {
+        reservation.close(() => reject(new Error('Failed to reserve a loopback port')));
+        return;
       }
-    } catch {
-      // notifications and unparseable lines are ignored
+      reservation.close((error) => error ? reject(error) : resolve(address.port));
+    });
+  });
+}
+
+interface HealthResponse {
+  statusCode: number;
+  body: string;
+}
+
+async function requestHealth(port: number): Promise<HealthResponse> {
+  return await new Promise((resolve, reject) => {
+    const probe = request({ hostname: '127.0.0.1', port, path: '/health', method: 'GET' }, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk: string) => {
+        body += chunk;
+        if (body.length > MAX_HEALTH_RESPONSE_CHARS) {
+          response.destroy();
+          reject(new Error(`HTTP health response exceeded ${MAX_HEALTH_RESPONSE_CHARS} characters`));
+        }
+      });
+      response.once('end', () => resolve({ statusCode: response.statusCode ?? 0, body }));
+      response.once('error', reject);
+    });
+    probe.once('error', reject);
+    probe.setTimeout(500, () => probe.destroy(new Error('HTTP health request timed out after 500ms')));
+    probe.end();
+  });
+}
+
+function getChildStartupFailure(child: ChildProcess, output: ChildOutputState): Error | undefined {
+  if (output.spawnError) {
+    return new Error(`HTTP CLI failed to spawn: ${output.spawnError.message}; ${diagnostics(child, output)}`);
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return new Error(`HTTP CLI exited before health became ready: ${diagnostics(child, output)}`);
+  }
+  return undefined;
+}
+
+function getHealthStatusError(statusCode: number): string | undefined {
+  if (statusCode < 200) return `HTTP ${statusCode}`;
+  if (statusCode >= 300) return `HTTP ${statusCode}`;
+  return undefined;
+}
+
+async function waitForHealth(
+  child: ChildProcess,
+  port: number,
+  output: ChildOutputState,
+  timeoutMs = 10000,
+): Promise<unknown> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = '';
+  while (Date.now() < deadline) {
+    const childFailure = getChildStartupFailure(child, output);
+    if (childFailure) throw childFailure;
+    try {
+      const response = await requestHealth(port);
+      const statusError = getHealthStatusError(response.statusCode);
+      if (statusError) lastError = statusError;
+      else return JSON.parse(response.body);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for HTTP CLI health after ${timeoutMs}ms: lastError=${lastError}; ${diagnostics(child, output)}`);
+}
+
+function createHttpCliConfig({
+  stateless = false,
+  readyTimeoutMs = 10000,
+  args = [DIST_CLI],
+  reservePort = reserveLoopbackPort,
+}: SpawnHttpCliOptions): HttpCliConfig {
+  return {
+    stateless,
+    readyTimeoutMs,
+    args,
+    reservePort,
+  };
+}
+
+function createChildCloser(child: ChildProcess, output: ChildOutputState): () => Promise<void> {
+  const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+  return async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill('SIGTERM');
+    const completed = await Promise.race([closed.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000))]);
+    if (completed || child.exitCode !== null || child.signalCode !== null) return;
+    child.kill('SIGKILL');
+    const forced = await Promise.race([closed.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000))]);
+    if (!forced) throw new Error(`HTTP CLI did not exit after forced cleanup: ${diagnostics(child, output)}`);
+  };
+}
+
+function createHttpCliAttempt(port: number, config: HttpCliConfig): HttpCliAttempt {
+  const output: ChildOutputState = { stdout: '', stderr: '' };
+  const child = spawn(process.execPath, config.args, {
+    env: createHttpCliEnvironment(port, config.stateless),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { output.stdout = appendOutputTail(output.stdout, chunk); });
+  child.stderr.on('data', (chunk) => { output.stderr = appendOutputTail(output.stderr, chunk); });
+  child.once('error', (error) => { output.spawnError = error; });
+  return { child, url: new URL(`http://127.0.0.1:${port}/mcp`), output, close: createChildCloser(child, output) };
+}
+
+async function captureCleanupFailure(close: () => Promise<void>): Promise<string | undefined> {
+  try {
+    await close();
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+function getErrorCode(error: Error): string | undefined {
+  const code = (error as Error & { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+async function startHttpCliAttempt(port: number, config: HttpCliConfig): Promise<SpawnedHttpCli> {
+  const attempt = createHttpCliAttempt(port, config);
+  try {
+    const health = await waitForHealth(attempt.child, port, attempt.output, config.readyTimeoutMs);
+    return { url: attempt.url, health, close: attempt.close };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const code = error instanceof Error ? getErrorCode(error) : undefined;
+    const cleanupFailure = await captureCleanupFailure(attempt.close);
+    const cleanupError = cleanupFailure ? `; cleanupFailure=${JSON.stringify(cleanupFailure)}` : '';
+    throw new HttpCliStartupError(
+      `${message}; cleanup=${diagnostics(attempt.child, attempt.output)}${cleanupError}`,
+      attempt.output.stderr,
+      code,
+    );
+  }
+}
+
+function isAddressInUse(error: Error): boolean {
+  return getErrorCode(error) === 'EADDRINUSE'
+    || error instanceof HttpCliStartupError && error.startupStderr.includes('EADDRINUSE');
+}
+
+/** Starts the built CLI on an isolated loopback port and waits for /health. */
+export async function spawnHttpCli(options: SpawnHttpCliOptions = {}): Promise<SpawnedHttpCli> {
+  const config = createHttpCliConfig(options);
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= MAX_HTTP_CLI_START_ATTEMPTS; attempt++) {
+    try {
+      return await startHttpCliAttempt(await config.reservePort(), config);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (!isAddressInUse(lastError) || attempt === MAX_HTTP_CLI_START_ATTEMPTS) break;
     }
   }
-  return responses;
+  if (!lastError) throw new Error('HTTP CLI startup ended without an error diagnostic');
+  if (!isAddressInUse(lastError)) throw lastError;
+  throw new Error(`HTTP CLI startup exhausted ${MAX_HTTP_CLI_START_ATTEMPTS} attempts after confirmed EADDRINUSE: ${lastError.message}`);
+}
+
+/** Keep STDIN open until every requested response arrives. EOF disconnects the SDK. */
+export const spawnWithMessages = spawnWithMessagesAsync;
+
+/**
+ * Asynchronous variant used when the parent process hosts local target or
+ * solver servers that must continue servicing requests while the MCP child is
+ * running.
+ */
+export async function spawnWithMessagesAsync(
+  messages: object[],
+  searxngUrl: string = LIVE_URL ?? '',
+  timeoutMs = 15000,
+  environmentOverrides: NodeJS.ProcessEnv = {},
+): Promise<Record<number, any>> {
+  const input = messages.map((message) => JSON.stringify(message)).join('\n') + '\n';
+
+  return await new Promise((resolve, reject) => {
+    const child = spawn('node', [DIST_CLI], {
+      env: {
+        ...process.env,
+        ...environmentOverrides,
+        SEARXNG_URL: searxngUrl,
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let stdout = '';
+    let pendingOutput = '';
+    const pendingIds = new Set(messages.flatMap(message =>
+      'id' in message && (typeof message.id === 'string' || typeof message.id === 'number') ? [message.id] : []));
+    let stderr = '';
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      pendingOutput += chunk;
+      let newline: number;
+      while ((newline = pendingOutput.indexOf('\n')) !== -1) {
+        const line = pendingOutput.slice(0, newline);
+        pendingOutput = pendingOutput.slice(newline + 1);
+        try {
+          const message = JSON.parse(line);
+          if (message && ('result' in message || 'error' in message)) pendingIds.delete(message.id);
+        } catch { /* Ignore non-JSON diagnostic lines, as response parsing does below. */ }
+      }
+      if (pendingIds.size === 0 && !child.stdin.writableEnded) child.stdin.end();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.once('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once('close', (code) => {
+      clearTimeout(timeout);
+      if (timedOut) {
+        reject(new Error(`MCP child timed out after ${timeoutMs}ms`));
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(`MCP child exited with code ${code}: ${stderr.trim()}`));
+        return;
+      }
+
+      if (pendingIds.size > 0) {
+        reject(new Error('MCP child disconnected before all responses arrived: ' + [...pendingIds].join(', ')));
+        return;
+      }
+      const responses: Record<number, any> = {};
+      for (const line of stdout.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+        try {
+          const message = JSON.parse(trimmed);
+          if (message.id !== undefined) {
+            responses[message.id] = message;
+          }
+        } catch {
+          // Notifications and unparseable lines are ignored.
+        }
+      }
+      resolve(responses);
+    });
+
+    child.stdin.once('error', error => {
+      clearTimeout(timeout);
+      child.kill();
+      reject(error);
+    });
+    child.stdin.write(input);
+    if (pendingIds.size === 0) child.stdin.end();
+  });
 }

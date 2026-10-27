@@ -1,0 +1,1003 @@
+#!/usr/bin/env tsx
+
+/**
+ * Unit Tests: public documentation guides
+ *
+ * Keeps public guidance aligned with the current server contract.
+ */
+
+import { strict as assert } from 'node:assert';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import {
+  MAX_CONCURRENT_PDF_WORKERS,
+  MAX_PDF_BYTES,
+  MAX_PDF_PAGES,
+  PDF_PARSE_TIMEOUT_MS,
+  PDF_WORKER_RESOURCE_LIMITS,
+} from '../../src/pdf-reader.js';
+import {
+  DEFAULT_BYPARR_CONCURRENCY,
+  DEFAULT_BYPARR_TIMEOUT_SECONDS,
+  DEFAULT_FLARESOLVERR_CONCURRENCY,
+  DEFAULT_FLARESOLVERR_TIMEOUT_MS,
+  MAX_BYPARR_CONCURRENCY,
+  MAX_BYPARR_TIMEOUT_SECONDS,
+  MAX_FLARESOLVERR_CONCURRENCY,
+  MAX_FLARESOLVERR_TIMEOUT_MS,
+} from '../../src/browser-solver.js';
+import { LITE_READ_URL_TOOL, READ_URL_TOOL } from '../../src/types.js';
+import {
+  DEFAULT_STATELESS_MAX_IN_FLIGHT,
+  DEFAULT_STATELESS_MAX_IN_FLIGHT_PER_IP,
+  DEFAULT_STATELESS_REQUEST_TIMEOUT_MS,
+  MAX_STATELESS_MAX_IN_FLIGHT,
+} from '../../src/http-server.js';
+import { createTestResults, printTestSummary, TestResult, testFunction } from '../helpers/test-utils.js';
+
+const results = createTestResults();
+const guideUrl = new URL('../../docs/client-configurations.md', import.meta.url);
+
+// User contracts remain discoverable after moving detail out of the README.
+function readUsageDocumentation(): string {
+  return ['README.md', 'docs/tools.md', 'docs/http-server.md'].map(file =>
+    readText(new URL('../../' + file, import.meta.url))).join('\n');
+}
+
+function markdownOutsideFences(document: string): string {
+  let fence: { marker: string; length: number } | undefined;
+  const visibleLines: string[] = [];
+  for (const line of document.split(/\r?\n/u)) {
+    const delimiter = /^ {0,3}(\x60{3,}|~{3,})(.*)$/u.exec(line);
+    if (fence) {
+      if (delimiter && delimiter[1][0] === fence.marker &&
+          delimiter[1].length >= fence.length && delimiter[2].trim() === '') fence = undefined;
+      continue;
+    }
+    if (delimiter) {
+      fence = { marker: delimiter[1][0], length: delimiter[1].length };
+      continue;
+    }
+    visibleLines.push(line);
+  }
+  return visibleLines.join('\n');
+}
+
+function markdownAnchors(document: string): string[] {
+  const visible = markdownOutsideFences(document);
+  const headings = new Set<string>();
+  // Constructors keep special regex characters unambiguous to the metrics parser.
+  const headingPattern = new RegExp('^#{1,6}[ \t]+(.+)$', 'gmu');
+  const closingHeadingPattern = new RegExp('[ \t]+#+[ \t]*$', 'u');
+  const anchorPattern = new RegExp('<a id="([^"]+)"', 'gu');
+  for (const heading of visible.matchAll(headingPattern)) {
+    const base = heading[1].replace(closingHeadingPattern, '').trim().toLowerCase()
+      .replace(/[^\p{L}\p{N}_\-\s]/gu, '').replace(/\s/gu, '-');
+    let slug = base;
+    let suffix = 0;
+    while (headings.has(slug)) slug = base + '-' + ++suffix;
+    headings.add(slug);
+  }
+  const explicitIds = [...visible.matchAll(anchorPattern)].map(anchor => anchor[1]);
+  return [...headings, ...explicitIds];
+}
+
+const researchGuideUrl = new URL('../../docs/research-workflow.md', import.meta.url);
+const deploymentGuideUrl = new URL('../../docs/deployment-profiles.md', import.meta.url);
+const baseComposeUrl = new URL('../../docker-compose.yml', import.meta.url);
+const resourceOverlayUrl = new URL('../../docker-compose.resources.yml', import.meta.url);
+const httpOverlayUrl = new URL('../../docker-compose.http.yml', import.meta.url);
+const markdownFence = String.fromCharCode(96).repeat(3);
+const workflowUrls = {
+  ci: new URL('../../.github/workflows/ci.yml', import.meta.url),
+  codeql: new URL('../../.github/workflows/codeql.yml', import.meta.url),
+  dockerPublish: new URL('../../.github/workflows/docker-publish.yml', import.meta.url),
+  npmPublish: new URL('../../.github/workflows/npm-publish.yml', import.meta.url),
+  scorecard: new URL('../../.github/workflows/scorecard.yml', import.meta.url),
+};
+
+const expectedMatrixRows = [
+  '| Claude Desktop | Yes | Yes | Not provided |',
+  '| Claude Code | Yes | Yes | Yes |',
+  '| Codex CLI | Yes | Yes | Yes |',
+  '| Cursor | Yes | Yes | Not provided |',
+  '| VS Code | Yes | Yes | Yes |',
+  '| Windsurf | Yes | Yes | Yes |',
+  '| Cline | Yes | Yes | Yes |',
+  '| OpenCode | Yes | Yes | Yes |',
+];
+
+const expectedTools = [
+  'searxng_web_search',
+  'searxng_search_suggestions',
+  'searxng_instance_info',
+  'web_url_read',
+];
+
+function readText(url: URL): string {
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- all callers pass compile-time repository URLs
+  return readFileSync(url, 'utf-8');
+}
+
+type DependabotIgnoreState = {
+  ignoreIndentation: number;
+  updateIndentation: number;
+};
+
+type YamlLine = {
+  indentation: number;
+  text: string;
+};
+
+type PackageManifest = {
+  engines?: Record<string, unknown>;
+};
+
+type WorkflowActionReference = {
+  repository: string;
+  release: string | undefined;
+  sha: string;
+  sourceName: string;
+};
+
+function toYamlLine(rawLine: string): YamlLine {
+  return {
+    indentation: rawLine.length - rawLine.trimStart().length,
+    text: rawLine.replace(/\s+#.*$/u, '').trim(),
+  };
+}
+
+function isDependabotUpdate(line: YamlLine): boolean {
+  return /^-\s+package-ecosystem\s*:/u.test(line.text);
+}
+
+function isNextUpdateEntry(state: DependabotIgnoreState, line: YamlLine): boolean {
+  return state.updateIndentation !== -1
+    && line.indentation <= state.updateIndentation
+    && /^-\s+/u.test(line.text);
+}
+
+function startsIgnoreBlock(state: DependabotIgnoreState, line: YamlLine): boolean {
+  return state.updateIndentation !== -1
+    && line.indentation > state.updateIndentation
+    && /^ignore\s*:\s*$/u.test(line.text);
+}
+
+function endsIgnoreBlock(state: DependabotIgnoreState, line: YamlLine): boolean {
+  return state.ignoreIndentation !== -1 && line.indentation <= state.ignoreIndentation;
+}
+
+function nextDependabotIgnoreState(state: DependabotIgnoreState, line: YamlLine): DependabotIgnoreState {
+  if (line.text === '') return state;
+  if (isDependabotUpdate(line)) return { updateIndentation: line.indentation, ignoreIndentation: -1 };
+  if (isNextUpdateEntry(state, line)) return { updateIndentation: -1, ignoreIndentation: -1 };
+  if (startsIgnoreBlock(state, line)) return { ...state, ignoreIndentation: line.indentation };
+  if (endsIgnoreBlock(state, line)) return { ...state, ignoreIndentation: -1 };
+  return state;
+}
+
+function unquoteYamlScalar(value: string): string {
+  const trimmed = value.trim();
+  const quote = trimmed[0];
+  return quote === '"' || quote === "'" ? trimmed.slice(1, -1) : trimmed;
+}
+
+function dependencyNameFromIgnoreItem(line: YamlLine): string | undefined {
+  const match = line.text.match(/^-\s*dependency-name\s*:\s*(.+?)\s*$/u);
+  return match === null ? undefined : unquoteYamlScalar(match[1]);
+}
+
+function isIgnoredDependency(state: DependabotIgnoreState, line: YamlLine, dependencyName: string): boolean {
+  return state.ignoreIndentation !== -1
+    && line.indentation > state.ignoreIndentation
+    && dependencyNameFromIgnoreItem(line) === dependencyName;
+}
+
+function hasDependabotIgnoreEntry(source: string, dependencyName: string): boolean {
+  let state: DependabotIgnoreState = { updateIndentation: -1, ignoreIndentation: -1 };
+  for (const rawLine of source.split(/\r?\n/u)) {
+    const line = toYamlLine(rawLine);
+    state = nextDependabotIgnoreState(state, line);
+    if (isIgnoredDependency(state, line, dependencyName)) return true;
+  }
+  return false;
+}
+
+function minimumNodeMajor(): number {
+  const packageManifest = JSON.parse(readText(new URL('../../package.json', import.meta.url))) as PackageManifest;
+  const nodePolicy = packageManifest.engines?.node;
+  assert.equal(typeof nodePolicy, 'string', 'package.json must declare engines.node');
+  const match = /^>=(\d+)$/u.exec(nodePolicy);
+  assert.ok(match, 'engines.node must use the >=N policy shape');
+  const minimum = Number(match[1]);
+  assert.ok(Number.isSafeInteger(minimum) && minimum > 0, 'engines.node minimum must be a positive integer');
+  assert.equal(minimum % 2, 0, 'engines.node minimum must be an even Node major');
+  return minimum;
+}
+
+function assertReadmeNodePolicy(readme: string, minimumNode: number): void {
+  assert.ok(readme.includes(`Node.js ${minimumNode} or later is required.`));
+  assert.ok(!readme.includes(`Node.js ${minimumNode - 2}`), 'README must not claim prior Node support');
+  for (const formerPromise of [
+    `Node.js ${minimumNode - 2} remains supported`,
+    `Node.js ${minimumNode - 2} will be removed`,
+    `Node.js ${minimumNode} or later is recommended`,
+  ]) {
+    assert.ok(!readme.includes(formerPromise), `README must not retain: ${formerPromise}`);
+  }
+}
+
+function assertClientGuideNodePolicy(guide: string, minimumNode: number): void {
+  assert.ok(guide.includes(`Requires Node.js ${minimumNode} or later.`));
+  assert.ok(!guide.includes(`Node.js ${minimumNode - 2}`), 'client guide must not claim prior Node support');
+  for (const formerPromise of [
+    `Requires Node.js ${minimumNode - 2}`,
+    `Node.js ${minimumNode - 2} remains supported`,
+    `Node.js ${minimumNode - 2} will be removed`,
+    `Node.js ${minimumNode} or later is recommended`,
+  ]) {
+    assert.ok(!guide.includes(formerPromise), `client guide must not retain: ${formerPromise}`);
+  }
+}
+
+function assertCiMatrix(ci: string, minimumNode: number): void {
+  const matrix = ci.match(/^\s*node-version:\s*\[([^\]]+)\]\s*$/mu);
+  assert.ok(matrix, 'CI must declare an inline Node version matrix');
+  const versions = [...matrix[1].matchAll(/['"]([^'"]+)['"]/gu)].map((match) => match[1]);
+  const majors = versions.map((version) => {
+    const segments = version.split('.');
+    assert.ok(segments.length === 1 || segments.length === 3, `CI Node version must be a major or complete patch version: ${version}`);
+    assert.ok(segments.every((segment) => segment.length > 0 && [...segment].every((character) => character >= '0' && character <= '9')),
+      `CI Node version must contain only decimal numbers: ${version}`);
+    return Number(segments[0]);
+  });
+  assert.deepEqual(majors, [minimumNode, minimumNode + 2, minimumNode + 4]);
+}
+
+function assertCiCommonJob(ci: string): void {
+  const jobs = ci.slice(ci.indexOf('jobs:'));
+  assert.deepEqual((jobs.match(/^  [A-Za-z0-9_-]+:\s*$/gmu) ?? []).map((line) => line.trim()), ['test:']);
+  assert.match(ci, /uses:\s*actions\/checkout@/u);
+  assert.match(ci, /uses:\s*actions\/setup-node@/u);
+  assert.match(ci, /cache:\s*['"]npm['"]/u);
+  for (const command of [
+    /run:\s*npm ci/u,
+    /run:\s*npm run lint/u,
+    /run:\s*npm run build/u,
+    /run:\s*npm run test:coverage/u,
+    /run:\s*npm run test:e2e/u,
+  ]) {
+    assert.match(ci, command);
+  }
+  assert.match(ci, /run:\s*npm run test:coverage\s*\n\s*- name: E2E tests\s*\n\s*run:\s*npm run test:e2e/u);
+  assert.doesNotMatch(ci, /^\s*include\s*:/mu);
+  assert.doesNotMatch(ci, /^\s*if\s*:/mu);
+  assert.doesNotMatch(ci, /continue-on-error\s*:/u);
+}
+
+function extractWorkflowActionReferences(sourceName: string, workflow: string): WorkflowActionReference[] {
+  const references: WorkflowActionReference[] = [];
+  for (const [index, line] of workflow.split(/\r?\n/u).entries()) {
+    if (!/^\s*-?\s*uses\s*:/u.test(line)) continue;
+    const [actionSource, ...commentParts] = line.split('#');
+    const reference = actionSource.replace(/^\s*-?\s*uses:\s*/u, '').trimEnd();
+    if (reference.startsWith('./')) continue;
+    const match = /^([^@\s]+)@([^\s#]+)$/u.exec(reference);
+    assert.ok(match, `${sourceName}:${index + 1} must use a pinned external action reference`);
+    const path = match[1];
+    const pathSegments = path.split('/');
+    assert.ok(pathSegments.length >= 2, `${sourceName}:${index + 1} must name an action repository`);
+    references.push({
+      repository: pathSegments.slice(0, 2).join('/'),
+      sha: match[2],
+      release: commentParts.length === 0 ? undefined : commentParts.join('#').trim(),
+      sourceName,
+    });
+  }
+  return references;
+}
+
+function assertImmutableWorkflowActionPins(workflows: Record<string, string>): void {
+  const pinnedActions = Object.entries(workflows).flatMap(([sourceName, workflow]) => (
+    extractWorkflowActionReferences(sourceName, workflow)
+  ));
+  assert.ok(pinnedActions.length > 0, 'workflow sources must use external actions');
+
+  const pinsByRepository = new Map<string, { release: string; sha: string }>();
+  for (const action of pinnedActions) {
+    assert.match(action.sha, /^[a-f0-9]{40}$/u, `${action.sourceName} must use a lowercase 40-hex commit pin`);
+    assert.match(action.release ?? '', /^v\d+\.\d+\.\d+$/u, `${action.sourceName} must annotate each action pin with an exact semver comment`);
+    const existing = pinsByRepository.get(action.repository);
+    const pin = { release: action.release as string, sha: action.sha };
+    if (existing !== undefined) {
+      assert.deepEqual(pin, existing, `${action.repository} must use one consistent SHA and release comment`);
+    } else {
+      pinsByRepository.set(action.repository, pin);
+    }
+  }
+}
+
+function assertWorkflowPinFixtures(): void {
+  const refreshedPin = 'b'.repeat(40);
+  const refreshedRelease = 'v2.3.4';
+  const refreshedWorkflow = `steps:\n  - uses: actions/example@${refreshedPin} # ${refreshedRelease}`;
+  assert.doesNotThrow(() => assertImmutableWorkflowActionPins({ first: refreshedWorkflow, second: refreshedWorkflow }));
+
+  const invalidFixtures = [
+    `steps:\n  - uses: actions/example@main # ${refreshedRelease}`,
+    `steps:\n  - uses: actions/example@${'A'.repeat(40)} # ${refreshedRelease}`,
+    `steps:\n  - uses: actions/example@${refreshedPin}`,
+    `steps:\n  - uses: actions/example@${refreshedPin} # version 2.3.4`,
+  ];
+  for (const fixture of invalidFixtures) {
+    assert.throws(() => assertImmutableWorkflowActionPins({ fixture }));
+  }
+  assert.throws(() => assertImmutableWorkflowActionPins({
+    first: refreshedWorkflow,
+    second: `steps:\n  - uses: actions/example@${'c'.repeat(40)} # v2.3.5`,
+  }));
+}
+
+function assertDependabotUnpdfPolicy(dependabot: string): void {
+  const ignoredUnpdfFixture = `updates:
+  - package-ecosystem: npm
+    ignore:
+      - dependency-name: "unpdf" # controlled ignored package
+`;
+  const allowedUnpdfFixture = `updates:
+  - package-ecosystem: npm
+    allow:
+      - dependency-name: unpdf # controlled allowed package
+`;
+  assert.ok(hasDependabotIgnoreEntry(ignoredUnpdfFixture, 'unpdf'));
+  assert.ok(!hasDependabotIgnoreEntry(allowedUnpdfFixture, 'unpdf'));
+  assert.ok(!hasDependabotIgnoreEntry(dependabot, 'unpdf'));
+}
+
+function extractFences(markdown: string, language: string): string[] {
+  const blocks: string[] = [];
+  let active: string[] | null = null;
+
+  for (const line of markdown.split(/\r?\n/u)) {
+    if (active === null && line.trim() === markdownFence + language) {
+      active = [];
+    } else if (active !== null && line.trim() === markdownFence) {
+      blocks.push(active.join('\n'));
+      active = null;
+    } else if (active !== null) {
+      active.push(line);
+    }
+  }
+
+  assert.equal(active, null, `unclosed ${language} fence`);
+  return blocks;
+}
+
+function parseTomlSubset(source: string): void {
+  let hasSection = false;
+  const allowedNameCharacters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-';
+
+  for (const rawLine of source.split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (line === '' || line.startsWith('#')) continue;
+
+    if (line.startsWith('[') && line.endsWith(']')) {
+      const name = line.slice(1, -1);
+      assert.ok(name.length > 0);
+      assert.ok([...name].every((character) => allowedNameCharacters.includes(character)));
+      hasSection = true;
+      continue;
+    }
+
+    const separator = line.indexOf('=');
+    assert.ok(separator > 0, `missing TOML assignment: ${line}`);
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    assert.ok([...key].every((character) => allowedNameCharacters.includes(character)));
+    const parsed = JSON.parse(value);
+    assert.ok(typeof parsed === 'string' || (
+      Array.isArray(parsed) && parsed.every((entry) => typeof entry === 'string')
+    ), `unsupported TOML value: ${value}`);
+  }
+
+  assert.ok(hasSection, 'each TOML example must contain a table');
+}
+
+function collectJsonServers(config: Record<string, unknown>): Record<string, unknown>[] {
+  const roots = [
+    config.mcpServers,
+    config.servers,
+    (config.mcp as Record<string, unknown> | undefined)?.servers,
+  ];
+
+  return roots.flatMap((root) => (
+    root && typeof root === 'object'
+      ? Object.values(root as Record<string, unknown>)
+          .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object')
+      : []
+  ));
+}
+
+export async function runTests(): Promise<TestResult> {
+  console.log('Testing: public documentation guides\n');
+
+  await testFunction('README documents bounded PDF text extraction and its limits', () => {
+    const readme = readUsageDocumentation();
+    const maxPdfMiB = MAX_PDF_BYTES / (1024 * 1024);
+    const parseTimeoutSeconds = PDF_PARSE_TIMEOUT_MS / 1000;
+    assert.equal(MAX_CONCURRENT_PDF_WORKERS, 2);
+    for (const statement of [
+      'PDF (`application/pdf`) text is extracted',
+      `${maxPdfMiB} MiB`,
+      `${MAX_PDF_PAGES} pages`,
+      `${parseTimeoutSeconds}-second`,
+      'At most two PDF extractions run concurrently per MCP process',
+      'OCR is not supported',
+      'password-protected',
+    ]) {
+      assert.ok(readme.includes(statement), `README must document: ${statement}`);
+    }
+  }, results);
+
+  await testFunction('public solver documentation states the verified provider boundary', () => {
+    const readme = readUsageDocumentation();
+    const configuration = readText(new URL('../../CONFIGURATION.md', import.meta.url));
+    const security = readText(new URL('../../SECURITY.md', import.meta.url));
+
+    for (const document of [configuration, security]) {
+      assert.ok(document.includes('FlareSolverr 3.5.2'));
+      assert.ok(document.includes('Byparr 3.0.4'));
+      assert.ok(document.includes('2026-09-18'));
+      assert.ok(document.includes(
+        'sha256:c80ae007ce2ccdcd217a12426e4f039ef763ff90738c808d38810c3e59323767',
+      ));
+      assert.ok(document.includes(
+        'sha256:874f719518f617d03a60e03411fc5d090647e1a877041e81f8dc965927c7deb6',
+      ));
+      assert.ok(document.includes('linux/amd64'));
+      assert.ok(document.includes('remote browser may'));
+      assert.ok(document.includes('HTTP client'));
+      assert.ok(document.includes('disconnects'));
+    }
+    for (const document of [configuration]) {
+      const normalized = document.replace(/\s+/gu, ' ');
+      assert.ok(normalized.includes('FlareSolverr is always primary'));
+      assert.ok(normalized.includes('155 seconds'));
+      assert.ok(normalized.includes('unavailable'));
+    }
+    const normalizedSecurity = security.replace(/\s+/gu, ' ');
+    assert.ok(normalizedSecurity.includes('FlareSolverr as the fixed primary'));
+    assert.ok(normalizedSecurity.includes('155 seconds'));
+    assert.ok(normalizedSecurity.includes('unavailable'));
+    assert.ok(readme.includes('browser-solver-verification.md'));
+    assert.ok(configuration.includes('automatic reverse failover is not performed'));
+    assert.ok(security.includes('does not retain a health score'));
+    for (const contract of [
+      `\`FLARESOLVERR_TIMEOUT_MS\` | No | \`${DEFAULT_FLARESOLVERR_TIMEOUT_MS}\``,
+      `from \`1\` through \`${MAX_FLARESOLVERR_TIMEOUT_MS}\``,
+      `\`FLARESOLVERR_MAX_CONCURRENT_REQUESTS\` | No | \`${DEFAULT_FLARESOLVERR_CONCURRENCY}\``,
+      `from \`1\` through \`${MAX_FLARESOLVERR_CONCURRENCY}\``,
+      `\`BYPARR_TIMEOUT_SECONDS\` | No | \`${DEFAULT_BYPARR_TIMEOUT_SECONDS}\``,
+      `from \`1\` through \`${MAX_BYPARR_TIMEOUT_SECONDS}\``,
+      `\`BYPARR_MAX_CONCURRENT_REQUESTS\` | No | \`${DEFAULT_BYPARR_CONCURRENCY}\``,
+      `from \`1\` through \`${MAX_BYPARR_CONCURRENCY}\``,
+    ]) {
+      assert.ok(configuration.includes(contract), `configuration must include: ${contract}`);
+    }
+
+    for (const tool of [LITE_READ_URL_TOOL, READ_URL_TOOL]) {
+      assert.ok(tool.description.includes('FlareSolverr first'));
+      assert.ok(tool.description.includes('Byparr'));
+      assert.ok(tool.description.includes('uncached direct'));
+    }
+  }, results);
+
+  await testFunction('public PDF guidance matches the source-backed worker limits', () => {
+    const configuration = readText(new URL('../../CONFIGURATION.md', import.meta.url));
+    const security = readText(new URL('../../SECURITY.md', import.meta.url));
+    const deployment = readText(deploymentGuideUrl);
+    const maxPdfMiB = MAX_PDF_BYTES / (1024 * 1024);
+    const parseTimeoutSeconds = PDF_PARSE_TIMEOUT_MS / 1000;
+    const workerHeapMiB = PDF_WORKER_RESOURCE_LIMITS.maxOldGenerationSizeMb;
+    const workerStackMiB = PDF_WORKER_RESOURCE_LIMITS.stackSizeMb;
+    assert.equal(MAX_CONCURRENT_PDF_WORKERS, 2);
+
+    for (const document of [configuration, security, deployment]) {
+      assert.ok(document.includes(`${maxPdfMiB} MiB`));
+      assert.ok(document.includes(`${MAX_PDF_PAGES} pages`));
+      assert.ok(document.includes(`${parseTimeoutSeconds}-second`));
+      assert.ok(document.includes(`${workerHeapMiB} MiB`));
+      assert.ok(document.includes(`${workerStackMiB} MiB`));
+      assert.ok(document.includes('two PDF extractions'));
+    }
+  }, results);
+
+  await testFunction('README, client guide, and CI state the declared Node support policy', () => {
+    const readme = readText(new URL('../../README.md', import.meta.url));
+    const minimumNode = minimumNodeMajor();
+    const ci = readText(workflowUrls.ci);
+    assertReadmeNodePolicy(readme, minimumNode);
+    assertClientGuideNodePolicy(readText(guideUrl), minimumNode);
+    assertCiMatrix(ci, minimumNode);
+    assertCiCommonJob(ci);
+  }, results);
+
+  await testFunction('workflow actions use immutable and internally consistent pins', () => {
+    assertWorkflowPinFixtures();
+    const workflows = Object.fromEntries(
+      Object.entries(workflowUrls).map(([name, url]) => [name, readText(url)]),
+    );
+    assertImmutableWorkflowActionPins(workflows);
+  }, results);
+
+  await testFunction('Dependabot may update unpdf', () => {
+    const dependabot = readText(new URL('../../.github/dependabot.yml', import.meta.url));
+    assertDependabotUnpdfPolicy(dependabot);
+  }, results);
+
+  await testFunction('Docker base updates ship with releases without an independent rebuild schedule', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixed repository workflow path
+    assert.ok(!existsSync(new URL('../../.github/workflows/docker-rebuild.yml', import.meta.url)));
+    const publish = readText(workflowUrls.dockerPublish);
+    assert.match(publish, /tags:\s*\n\s*- 'v\*'/u);
+    assert.ok(publish.includes('linux/amd64,linux/arm64'));
+    assert.ok(publish.includes('needs: scan_image'));
+    assert.ok(publish.includes('cosign sign'));
+    const security = readText(new URL('../../SECURITY.md', import.meta.url));
+    assert.ok(security.includes('committed to the Dockerfile'));
+    assert.ok(security.includes('independent weekly rebuild has been retired'));
+  }, results);
+
+  await testFunction('cookbook exists and README links to it', () => {
+    const guide = readText(guideUrl);
+    const readme = readText(new URL('../../README.md', import.meta.url));
+    assert.ok(guide.startsWith('# MCP Client Configuration Cookbook'));
+    assert.ok(readme.includes('/docs/client-configurations.md)'));
+  }, results);
+
+  await testFunction('recipe coverage identifies included and omitted client combinations', () => {
+    const guide = readText(guideUrl).split('## Recipe coverage')[1].split('## Choose your client')[0];
+    for (const row of expectedMatrixRows) {
+      assert.ok(guide.includes(row), `missing matrix row: ${row}`);
+    }
+    assert.equal((guide.match(/^\| (?:Claude Desktop|Claude Code|Codex CLI|Cursor|VS Code|Windsurf|Cline|OpenCode) \|/gmu) ?? []).length, 8);
+  }, results);
+
+  await testFunction('every JSON and TOML configuration snippet parses', () => {
+    const guide = readText(guideUrl);
+    const jsonBlocks = extractFences(guide, 'json');
+    const tomlBlocks = extractFences(guide, 'toml');
+    assert.ok(jsonBlocks.length >= 6, 'expected client JSON examples');
+    assert.ok(tomlBlocks.length >= 2, 'expected Codex TOML examples');
+    for (const block of jsonBlocks) JSON.parse(block);
+    for (const block of tomlBlocks) parseTomlSubset(block);
+  }, results);
+
+  await testFunction('local examples use current NPX and Docker launch contracts', () => {
+    const guide = readText(guideUrl);
+    const servers = extractFences(guide, 'json')
+      .flatMap((block) => collectJsonServers(JSON.parse(block) as Record<string, unknown>));
+
+    const localServers = servers.filter((server) => (
+      typeof server.command === 'string' || Array.isArray(server.command)
+    ));
+    assert.ok(localServers.some((server) => server.command === 'npx'));
+    assert.ok(localServers.some((server) => server.command === 'docker'));
+    assert.ok(localServers.some((server) => Array.isArray(server.command) && server.command[0] === 'npx'));
+    assert.ok(localServers.some((server) => Array.isArray(server.command) && server.command[0] === 'docker'));
+
+    for (const server of localServers) {
+      const command = Array.isArray(server.command)
+        ? server.command
+        : [server.command, ...(server.args as unknown[])];
+      if (command[0] === 'npx') {
+        assert.deepEqual(command, ['npx', '-y', 'mcp-searxng']);
+      } else if (command[0] === 'docker') {
+        assert.deepEqual(command, [
+          'docker',
+          'run', '-i', '--rm',
+          '-e', 'SEARXNG_URL',
+          'isokoliuk/mcp-searxng:latest',
+        ]);
+      }
+    }
+
+    assert.ok(guide.includes('SEARXNG_URL'));
+  }, results);
+
+  await testFunction('remote examples use the current endpoint and bearer header contract', () => {
+    const guide = readText(guideUrl);
+    const servers = extractFences(guide, 'json')
+      .flatMap((block) => collectJsonServers(JSON.parse(block) as Record<string, unknown>));
+    const remoteServers = servers.filter((server) => typeof server.url === 'string' || typeof server.serverUrl === 'string');
+    assert.ok(remoteServers.length >= 4, 'expected verified HTTP client examples');
+    for (const server of remoteServers) {
+      const url = String(server.url ?? server.serverUrl);
+      assert.ok(url.endsWith('/mcp'), `remote MCP URL must end in /mcp: ${url}`);
+      const headers = server.headers as Record<string, unknown> | undefined;
+      assert.ok(headers?.Authorization, 'authenticated remote examples must show Authorization handling');
+    }
+    assert.ok(guide.includes('MCP_HTTP_AUTH_TOKEN'));
+    assert.ok(guide.includes('MCP_HTTP_ALLOWED_ORIGINS'));
+    assert.ok(guide.includes('MCP_HTTP_ALLOWED_HOSTS'));
+  }, results);
+
+  await testFunction('verification checklist names all current tools', () => {
+    const guide = readText(guideUrl);
+    const types = readText(new URL('../../src/types.ts', import.meta.url));
+    for (const tool of expectedTools) {
+      assert.ok(guide.includes(`\`${tool}\``), `guide must name ${tool}`);
+      assert.ok(types.includes(`name: "${tool}"`), `source must still expose ${tool}`);
+    }
+  }, results);
+
+  await testFunction('research workflow exists and README links to it', () => {
+    const guide = readText(researchGuideUrl);
+    const readme = readText(new URL('../../README.md', import.meta.url));
+    assert.ok(guide.startsWith('# Evidence-Focused Research Workflow'));
+    assert.ok(readme.includes('/docs/research-workflow.md)'));
+  }, results);
+
+  await testFunction('research workflow uses current full schemas and describes Lite Tools limits', () => {
+    const guide = readText(researchGuideUrl);
+    const normalizedGuide = guide.replace(/\s+/gu, ' ');
+    const types = readText(new URL('../../src/types.ts', import.meta.url));
+    const fullSchemaParameters = [
+      'query', 'pageno', 'time_range', 'language', 'safesearch', 'min_score',
+      'num_results', 'categories', 'engines', 'response_format', 'result_detail',
+      'includeEngines', 'includeDisabled', 'category', 'refresh',
+      'url', 'startChar', 'maxLength', 'section', 'paragraphRange', 'readHeadings',
+    ];
+
+    for (const tool of expectedTools) {
+      assert.ok(guide.includes(`\`${tool}\``), `workflow must name ${tool}`);
+      assert.ok(types.includes(`name: "${tool}"`), `source must still expose ${tool}`);
+    }
+    for (const parameter of fullSchemaParameters) {
+      assert.ok(guide.includes(`\`${parameter}\``), `workflow must describe ${parameter}`);
+      assert.ok(types.includes(`${parameter}: {`), `full schemas must still expose ${parameter}`);
+    }
+    assert.ok(guide.includes('`SEARXNG_LITE_TOOLS=true`'));
+    assert.ok(normalizedGuide.includes('advertised schemas'));
+    assert.ok(!normalizedGuide.includes('selective page extraction require full mode'));
+  }, results);
+
+  await testFunction('documentation explains compact result detail and the full-mode migration boundary', () => {
+    const readme = readUsageDocumentation();
+    const configuration = readText(new URL('../../CONFIGURATION.md', import.meta.url));
+    const changelog = readText(new URL('../../CHANGELOG.md', import.meta.url));
+    const guide = readText(researchGuideUrl);
+    assert.ok(readme.includes('`result_detail`'));
+    assert.ok(readme.includes('line parsers'));
+    assert.ok(configuration.includes('compact and full'));
+    assert.ok(changelog.includes('## Unreleased'));
+    assert.ok(changelog.includes('result_detail'));
+    assert.ok(guide.includes('`result_detail`'));
+    assert.ok(readme.includes('Lite schema stays query-only'));
+    assert.ok(readme.includes('explicitly supplied optional overrides'));
+    assert.ok(guide.includes('Lite schema stays query-only'));
+    assert.ok(configuration.includes('both compact and full text/JSON responses'));
+    assert.ok(readme.includes('retaining engine-failure diagnostics'));
+    assert.ok(readme.includes('top-level `unresponsive_engines` field'));
+    assert.ok(readme.includes('score, engines, category, published date, thumbnail, image source'));
+    assert.ok(changelog.includes('full JSON content'));
+    assert.ok(guide.includes('invalid optional metadata is omitted'));
+    assert.ok(configuration.includes('normalizes line separators before applying the cap'));
+    assert.ok(readme.includes('Text fields are normalized to single lines'));
+  }, results);
+
+  await testFunction('research workflow is bounded and evidence focused', () => {
+    const guide = readText(researchGuideUrl);
+    for (const phrase of [
+      'Stopping conditions',
+      'Cross-check material claims',
+      'Cite the evidence',
+      'State uncertainty',
+      'Evidence versus inference',
+      'adjustable starting point',
+      '(self-hosted-searxng.md)',
+      '(public-searxng-instances.md)',
+    ]) {
+      assert.ok(guide.includes(phrase), `workflow must include: ${phrase}`);
+    }
+    for (const unsupportedPromise of [
+      'guarantees results',
+      'all engines are available',
+      'automatically private',
+    ]) {
+      assert.ok(!guide.includes(unsupportedPromise), `workflow must not promise: ${unsupportedPromise}`);
+    }
+  }, results);
+
+  await testFunction('deployment profiles exist and public navigation links to them', () => {
+    const guide = readText(deploymentGuideUrl);
+    const readme = readText(new URL('../../README.md', import.meta.url));
+    const configuration = readText(new URL('../../CONFIGURATION.md', import.meta.url));
+    const compose = readText(new URL('../../docker-compose.yml', import.meta.url));
+    assert.ok(guide.startsWith('# Measured MCP Deployment Profiles'));
+    assert.ok(readme.includes('/docs/deployment-profiles.md)'));
+    assert.ok(configuration.includes('(docs/deployment-profiles.md)'));
+    assert.ok(compose.includes('docs/deployment-profiles.md'));
+  }, results);
+
+  await testFunction('deployment measurements are traceable and recommendations remain bounded', () => {
+    const guide = readText(deploymentGuideUrl);
+    const normalizedGuide = guide.replace(/\s+/gu, ' ');
+    for (const evidence of [
+      '2026-07-29',
+      'Node 24.18.0',
+      'Docker Engine 29.6.2',
+      'linux/amd64',
+      'ecd0b7c99941d8e204d633676873058b2a07fffe',
+      '| Small | 1 | 160 | 6.03 s | 52.39-110.60 MiB | 8.72% | 11.39% |',
+      '| Balanced | 4 | 480 | 6.06 s | 53.43-139.30 MiB | 20.39% | 31.84% |',
+      '| Research-heavy | 8 | 960 | 6.06 s | 53.63-254.40 MiB | 40.80% | 65.32% |',
+      'starting range, not a universal requirement',
+      'does not size SearXNG',
+    ]) {
+      assert.ok(normalizedGuide.includes(evidence), `missing deployment evidence: ${evidence}`);
+    }
+  }, results);
+
+  await testFunction('deployment profiles use current configuration and valid MCP-only Compose fields', () => {
+    const guide = readText(deploymentGuideUrl);
+    const configuration = readText(new URL('../../CONFIGURATION.md', import.meta.url));
+    const baseCompose = readText(baseComposeUrl);
+    const overlay = readText(resourceOverlayUrl);
+    const variables = [
+      'SEARXNG_MAX_RESULTS',
+      'FETCH_TIMEOUT_MS',
+      'FLARESOLVERR_TIMEOUT_MS',
+      'FLARESOLVERR_MAX_CONCURRENT_REQUESTS',
+      'BYPARR_TIMEOUT_SECONDS',
+      'BYPARR_MAX_CONCURRENT_REQUESTS',
+      'SEARCH_CACHE_TTL_MS',
+      'SEARCH_CACHE_MAX_ENTRIES',
+      'URL_READ_MAX_CHARS',
+      'URL_READ_MAX_CONTENT_LENGTH_BYTES',
+      'CACHE_TTL_MS',
+      'CACHE_MAX_ENTRIES',
+      'SEARXNG_FANOUT',
+      'MCP_RATE_WINDOW_MS',
+      'MCP_RATE_INIT_MAX',
+      'MCP_RATE_SESSION_MAX',
+    ];
+    for (const variable of variables) {
+      assert.ok(guide.includes(`\`${variable}\``), `guide must name ${variable}`);
+      assert.ok(configuration.includes(`\`${variable}\``), `configuration must still define ${variable}`);
+    }
+    assert.ok(overlay.includes('cpus: ${MCP_SEARXNG_CPUS:-0.50}'));
+    assert.ok(overlay.includes('mem_limit: ${MCP_SEARXNG_MEMORY_LIMIT:-256m}'));
+    assert.ok(overlay.includes('mem_reservation: ${MCP_SEARXNG_MEMORY_RESERVATION:-192m}'));
+    assert.ok(!overlay.includes('\n  searxng:'), 'resource overlay must not add or size SearXNG');
+    assert.ok(!baseCompose.includes('ports:'), 'base Compose file must remain STDIO-only');
+    assert.ok(!baseCompose.includes('MCP_HTTP_'), 'base Compose file must not select HTTP transport');
+  }, results);
+
+  await testFunction('deployment HTTP Compose profile is fail-closed and service-aware', () => {
+    const guide = readText(deploymentGuideUrl);
+    const normalizedGuide = guide.replace(/\s+/gu, ' ');
+    const overlay = readText(httpOverlayUrl);
+    for (const contract of [
+      'MCP_HTTP_PORT=${MCP_HTTP_PORT:-3000}',
+      'MCP_HTTP_HOST=0.0.0.0',
+      'MCP_HTTP_HARDEN=true',
+      'MCP_HTTP_AUTH_TOKEN=${MCP_HTTP_AUTH_TOKEN:?',
+      'MCP_HTTP_ALLOWED_ORIGINS=${MCP_HTTP_ALLOWED_ORIGINS:?',
+      'MCP_HTTP_ALLOWED_HOSTS',
+      'MCP_HTTP_TRUST_PROXY',
+      '${MCP_SEARXNG_HTTP_BIND_ADDRESS:-127.0.0.1}',
+      '${MCP_SEARXNG_HTTP_PUBLISHED_PORT:-3000}',
+    ]) {
+      assert.ok(overlay.includes(contract), `HTTP overlay must include ${contract}`);
+    }
+    for (const composeFile of [
+      'docker-compose.yml',
+      'docker-compose.http.yml',
+      'docker-compose.resources.yml',
+    ]) {
+      assert.ok(guide.includes(composeFile), `guide must compose ${composeFile}`);
+    }
+    assert.match(guide, /docker compose[\s\S]+stats --no-stream mcp-searxng/u);
+    assert.match(guide, /docker compose[\s\S]+ps -q mcp-searxng/u);
+    assert.ok(guide.includes('--name mcp-searxng-profile'));
+    assert.ok(guide.includes('docker stats --no-stream mcp-searxng-profile'));
+    assert.ok(guide.includes('disposable placeholder'));
+    assert.ok(normalizedGuide.includes('passes no value for an optional variable'));
+    assert.ok(normalizedGuide.includes('replaces those defaults'));
+    assert.ok(normalizedGuide.includes('clients can spoof `X-Forwarded-For`'));
+    assert.ok(normalizedGuide.includes('prints expanded environment values'));
+    assert.ok(normalizedGuide.includes('differs from `MCP_HTTP_PORT`'));
+    assert.ok(normalizedGuide.includes('published port in `MCP_HTTP_ALLOWED_HOSTS`'));
+  }, results);
+
+  await testFunction('public docs define the configurable search response default and precedence', () => {
+    const readme = readUsageDocumentation();
+    const configuration = readText(new URL('../../CONFIGURATION.md', import.meta.url));
+    const precedence = 'If omitted, `SEARXNG_DEFAULT_RESPONSE_FORMAT` applies; if unset or invalid, `text` is used. An explicit `response_format` always takes precedence.';
+
+    assert.ok(readme.includes('`SEARXNG_DEFAULT_RESPONSE_FORMAT`'));
+    assert.ok(readme.includes(precedence));
+    assert.ok(readme.includes('auto-inject `response_format=text`'));
+
+    const searchDefaultsStart = configuration.indexOf('## Search Defaults');
+    const resultControlsStart = configuration.indexOf('## Search Result Controls');
+    assert.ok(searchDefaultsStart >= 0);
+    assert.ok(resultControlsStart > searchDefaultsStart);
+    const searchDefaults = configuration.slice(searchDefaultsStart, resultControlsStart);
+    assert.ok(searchDefaults.includes('| `SEARXNG_DEFAULT_RESPONSE_FORMAT` |'));
+    assert.ok(searchDefaults.includes('`text` or `json`'));
+    assert.ok(searchDefaults.includes(precedence));
+    assert.ok(searchDefaults.includes('auto-inject `response_format=text`'));
+    assert.ok(configuration.includes('also applies when `SEARXNG_LITE_TOOLS=true`'));
+    assert.ok(configuration.includes('callers that send `response_format` explicitly still override'));
+  }, results);
+
+  await testFunction('public docs define the optional stateless HTTP contract and fixed defaults', () => {
+    const readme = readUsageDocumentation();
+    const configuration = readText(new URL('../../CONFIGURATION.md', import.meta.url));
+    const security = readText(new URL('../../SECURITY.md', import.meta.url));
+
+    assert.equal(DEFAULT_STATELESS_MAX_IN_FLIGHT, 16);
+    assert.equal(DEFAULT_STATELESS_MAX_IN_FLIGHT_PER_IP, 8);
+    assert.equal(DEFAULT_STATELESS_REQUEST_TIMEOUT_MS, 900000);
+    assert.equal(MAX_STATELESS_MAX_IN_FLIGHT, 256);
+
+    for (const document of [readme, configuration, security]) {
+      assert.ok(document.includes('`MCP_HTTP_STATELESS=true`'));
+    }
+    assert.ok(readme.includes('Stateless mode is POST-only'));
+    assert.ok(readme.replace(/\s+/gu, ' ').includes('Every stateless POST creates a fresh MCP server and transport'));
+
+    for (const variable of [
+      'MCP_HTTP_STATELESS',
+      'MCP_HTTP_STATELESS_MAX_IN_FLIGHT',
+      'MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP',
+      'MCP_HTTP_STATELESS_REQUEST_TIMEOUT_MS',
+    ]) {
+      assert.ok(configuration.includes(`\`${variable}\``), `configuration must define ${variable}`);
+    }
+    assert.ok(configuration.includes('`16` (range `1`-`256`)'));
+    assert.ok(configuration.includes('`8` (range `1`-global cap)'));
+    assert.ok(configuration.includes('`900000` (range `1000`-`2147483647`)'));
+    assert.ok(configuration.includes('HTTP 503'));
+    assert.ok(configuration.includes('HTTP 504'));
+    assert.ok(configuration.includes('negotiated JSON or an SSE stream within that same POST'));
+    assert.ok(configuration.includes('Requests whose client IP cannot be resolved share one fail-closed capacity bucket'));
+
+    assert.ok(security.includes('does not preserve cross-request sessions'));
+    assert.ok(security.includes('global and per-client-IP in-flight caps'));
+    assert.ok(security.includes('clients can spoof `X-Forwarded-For`'));
+    assert.ok(security.includes('Requests whose client IP cannot be resolved share one fail-closed capacity bucket'));
+  }, results);
+
+  await testFunction('public documentation states current security, privacy, and configuration contracts', () => {
+    const readme = readText(new URL('../../README.md', import.meta.url));
+    const configuration = readText(new URL('../../CONFIGURATION.md', import.meta.url));
+    const security = readText(new URL('../../SECURITY.md', import.meta.url));
+    const normalizedSecurity = security.replace(/\s+/gu, ' ');
+    const changelog = readText(new URL('../../CHANGELOG.md', import.meta.url));
+    const index = readText(new URL('../../docs/index.md', import.meta.url));
+
+    assert.ok(readme.includes('operator-controlled or trusted SearXNG instance'));
+    assert.ok(readme.includes('As of 2026-07-29'));
+    assert.ok(readme.includes('| Pagination | ✓ | ✗ | ✓ | ✓ |'));
+    assert.ok(!readme.includes('| Privacy |'));
+
+    assert.ok(configuration.includes('all SearXNG-bound traffic'));
+    for (const document of [configuration, readme, readText(guideUrl)]) {
+      for (const block of extractFences(document, 'json')) {
+        const servers = collectJsonServers(JSON.parse(block) as Record<string, unknown>);
+        for (const server of servers) {
+          if (typeof server.command !== 'string' && !Array.isArray(server.command)) continue;
+          const env = (server.env ?? server.environment) as Record<string, unknown> | undefined;
+          assert.ok(!env?.MCP_HTTP_PORT, 'STDIO client examples must not start HTTP');
+        }
+      }
+      for (const block of extractFences(document, 'toml')) {
+        parseTomlSubset(block);
+        assert.doesNotMatch(block, /MCP_HTTP_PORT\s*=\s*["'][^"']/u, 'STDIO TOML must not start HTTP');
+      }
+    }
+    assert.ok(configuration.includes('must be configured together'));
+    assert.ok(configuration.includes('may be looser or stricter'));
+    assert.ok(configuration.includes('clients can spoof `X-Forwarded-For`'));
+
+    assert.ok(security.includes('Hardened mode protects the MCP protocol endpoint (`/mcp`)'));
+    assert.ok(security.includes('`GET /health` intentionally remains unauthenticated'));
+    assert.ok(security.includes('60 requests per minute'));
+    assert.ok(normalizedSecurity.includes('`status`, `server`, `version`, and `transport`'));
+    assert.ok(normalizedSecurity.includes('does not return the SearXNG URL or server configuration'));
+    assert.ok(security.includes('version fingerprinting'));
+
+    assert.ok(changelog.startsWith('# Changelog'));
+    assert.ok(changelog.includes('## [Unreleased]'));
+    assert.ok(changelog.includes('previously accepted numeric prefixes'));
+    assert.ok(changelog.includes('may be looser or stricter'));
+
+    for (const guide of [
+      'client-configurations.md',
+      'research-workflow.md',
+      'deployment-profiles.md',
+      'search-configuration.md',
+      'browser-solver-deployment.md',
+      'search-configuration-verification.md',
+    ]) {
+      assert.ok(index.includes(guide), `documentation index must link ${guide}`);
+    }
+  }, results);
+
+  await testFunction('private search stack keeps solver APIs unpublished and uses documented MCP settings', () => {
+    const configuration = readText(new URL('../../CONFIGURATION.md', import.meta.url));
+    const base = readText(new URL('../../docs/examples/search-stack/compose.yml', import.meta.url));
+    for (const file of ['compose.yml', 'flare.yml', 'byparr.yml']) {
+      const example = readText(new URL('../../docs/examples/search-stack/' + file, import.meta.url));
+      for (const match of example.matchAll(/^ {6}([A-Z][A-Z0-9_]+):/gmu)) {
+        if (['SEARXNG_SECRET', 'LOG_LEVEL', 'LOG_HTML'].includes(match[1])) continue;
+        assert.ok(configuration.includes('`' + match[1] + '`'), file + ': unknown MCP variable ' + match[1]);
+      }
+      assert.doesNotMatch(example, /^\s+internal: true/gmu, 'search/browser network needs intentional outbound access');
+      if (file !== 'compose.yml') {
+        assert.doesNotMatch(example, /^\s+ports:/gmu, 'solver API must have no published ports');
+        assert.match(example, /@sha256:[a-f0-9]{64}/u, 'solver image must be immutable');
+      }
+    }
+    assert.match(base, /"127\.0\.0\.1:\$\{SEARXNG_HOST_PORT:-18089\}:8080"/u);
+    assert.match(base, /"127\.0\.0\.1:\$\{MCP_HOST_PORT:-18300\}:3000"/u);
+    assert.doesNotMatch(base, /SEARXNG_MAX_RESULTS|SEARXNG_MAX_RESULT_CHARS/u, 'coverage profile must not impose output caps');
+    assert.ok(base.includes('${MCP_SOURCE_DIR:?'), 'private deployment must use an explicit source build context');
+    assert.ok(base.includes('${SEARXNG_SETTINGS_DIR:?'), 'writable upstream settings need an external directory');
+    assert.doesNotMatch(base, /- \.\/settings:|:\/etc\/searxng:ro/u, 'upstream settings must not mutate the tracked build context or fail entrypoint writes');
+    const flare = readText(new URL('../../docs/examples/search-stack/flare.yml', import.meta.url));
+    const byparr = readText(new URL('../../docs/examples/search-stack/byparr.yml', import.meta.url));
+    assert.ok(flare.includes(`FLARESOLVERR_TIMEOUT_MS: "${DEFAULT_FLARESOLVERR_TIMEOUT_MS}"`));
+    assert.ok(byparr.includes(`BYPARR_TIMEOUT_SECONDS: "${DEFAULT_BYPARR_TIMEOUT_SECONDS}"`));
+    assert.ok(flare.includes('http://flaresolverr:8191'));
+    assert.ok(byparr.includes('http://byparr:8191'));
+  }, results);
+
+  await testFunction('navigation anchors ignore code fences and distinguish repeated headings', () => {
+    const fixture = ['# Setup', '```bash', '# Not a heading', '```',
+      '# Setup', '~~~', '# Also code', '~~~', '# Setup-1', '# Setup',
+      '<a id="old-setup"></a>'].join('\n');
+    assert.deepEqual(markdownAnchors(fixture), ['setup', 'setup-1', 'setup-1-1', 'setup-2', 'old-setup']);
+  }, results);
+
+  await testFunction('documentation navigation resolves files and section anchors', () => {
+    const files = ['README.md', 'CONFIGURATION.md', 'CONTRIBUTING.md', 'SECURITY.md',
+      'docs/index.md', 'docs/tools.md', 'docs/http-server.md', 'docs/troubleshooting.md',
+      'docs/client-configurations.md', 'docs/public-searxng-instances.md',
+      'docs/self-hosted-searxng.md', 'docs/research-workflow.md', 'docs/deployment-profiles.md',
+      'docs/browser-solver-verification.md', 'docs/search-configuration.md',
+      'docs/browser-solver-deployment.md', 'docs/search-configuration-verification.md'];
+    const publicPrefix = 'https://github.com/ihor-sokoliuk/mcp-searxng/blob/main/';
+    for (const file of files) {
+      const source = new URL('../../' + file, import.meta.url);
+      const document = readText(source);
+      for (const match of document.matchAll(/\]\(([^\s)]+)\)/gu)) {
+        const link = match[1];
+        if (/^[a-z]+:/iu.test(link) && !link.startsWith(publicPrefix)) continue;
+        const target = link.startsWith(publicPrefix)
+          ? new URL('../../' + link.slice(publicPrefix.length), import.meta.url)
+          : new URL(link, source);
+        const fragment = decodeURIComponent(target.hash.slice(1));
+        target.hash = '';
+        // Repository-owned documentation links; no user-supplied filesystem paths.
+        // eslint-disable-next-line security/detect-non-literal-fs-filename
+        assert.ok(existsSync(target), file + ': missing target ' + link);
+        if (!fragment || !target.pathname.endsWith('.md')) continue;
+        const body = readText(target);
+        assert.ok(markdownAnchors(body).includes(fragment), file + ': missing anchor ' + link);
+      }
+    }
+  }, results);
+
+  printTestSummary(results, 'Public Documentation Guides');
+  return results;
+}
+
+if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
+  runTests().then((testResults) => {
+    process.exit(testResults.failed > 0 ? 1 : 0);
+  }).catch(console.error);
+}

@@ -30,13 +30,30 @@ import { testFunction, createTestResults, printTestSummary } from '../helpers/te
 const results = createTestResults();
 
 async function runTests() {
+  await testFunction('web search pages schema and validation are bounded integers', () => {
+    for (const pages of [1, 2, 5]) assert.equal(isSearXNGWebSearchArgs({ query: 'test', pages }), true);
+    for (const pages of [0, -1, 6, 1.5, NaN, Infinity, '2', null]) {
+      assert.equal(isSearXNGWebSearchArgs({ query: 'test', pages }), false);
+    }
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', pageno: Number.MAX_SAFE_INTEGER, pages: 2 }), false);
+    assert.deepEqual(WEB_SEARCH_TOOL.inputSchema.properties?.pages, {
+      type: 'integer', minimum: 1, maximum: 5, default: 1,
+      description: 'Fetch 1 to 5 consecutive pages concurrently starting at pageno; merge and deduplicate before applying the result limit. Failed pages are reported in failedPages in JSON output.',
+    });
+  }, results);
   console.log('🧪 Testing: types.ts\n');
 
   await testFunction('isSearXNGWebSearchArgs type guard - valid cases', () => {
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', language: 'en' }), true);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test search' }), true);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', pageno: 1, time_range: 'day' }), true);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', pageno: 2 }), true);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', pageno: 1, time_range: 'week', safesearch: 2 }), true);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: 0 }), true);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: 1 }), true);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: '0' }), true);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: '1' }), true);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: '2' }), true);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', min_score: 0 }), true);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', min_score: 1 }), true);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', num_results: 1 }), true);
@@ -56,11 +73,14 @@ async function runTests() {
   await testFunction('isSearXNGWebSearchArgs type guard - invalid optional parameters', () => {
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', pageno: 0 }), false);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', pageno: -1 }), false);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', pageno: 1.5 }), false);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', pageno: '1' }), false);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', time_range: 'last week' }), false);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', language: 123 }), false);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: 3 }), false);
-    assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: '1' }), false);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: '3' }), false);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: 'none' }), false);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', safesearch: 1.5 }), false);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', min_score: -0.1 }), false);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', min_score: 1.1 }), false);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', min_score: Number.NaN }), false);
@@ -74,9 +94,18 @@ async function runTests() {
   await testFunction('WEB_SEARCH_TOOL schema includes week, min_score, and num_results', () => {
     const properties = WEB_SEARCH_TOOL.inputSchema.properties as Record<string, any>;
     assert.ok(properties.time_range.enum.includes('week'));
+    assert.ok(properties.time_range.description.includes('time_range_support=true'));
+    assert.ok(WEB_SEARCH_TOOL.description.includes('request is rejected before search'));
+    assert.equal(properties.safesearch.type, 'string');
+    assert.deepEqual(properties.safesearch.enum, ['0', '1', '2']);
+    assert.equal(properties.safesearch.default, undefined);
+    assert.ok(!Object.hasOwn(properties.safesearch, 'default'));
+    assert.ok(!properties.safesearch.enum.some((value: unknown) => typeof value === 'number'));
     assert.equal(properties.min_score.type, 'number');
     assert.equal(properties.min_score.minimum, 0);
     assert.equal(properties.min_score.maximum, 1);
+    assert.equal(properties.pageno.type, 'integer');
+    assert.equal(properties.pageno.minimum, 1);
     assert.equal(properties.num_results.type, 'number');
     assert.equal(properties.num_results.minimum, 1);
     assert.equal(properties.num_results.maximum, 20);
@@ -231,8 +260,17 @@ async function runTests() {
   }, results);
 
   await testFunction('isSearXNGWebSearchArgs accepts response_format text or json', () => {
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test' }), true);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', response_format: 'text' }), true);
     assert.equal(isSearXNGWebSearchArgs({ query: 'test', response_format: 'json' }), true);
+  }, results);
+
+  await testFunction('isSearXNGWebSearchArgs accepts exact result_detail values and rejects non-exact values', () => {
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', result_detail: 'compact' }), true);
+    assert.equal(isSearXNGWebSearchArgs({ query: 'test', result_detail: 'full' }), true);
+    for (const invalid of ['Compact', ' full', 'full ', '', null, 1, true, [], {}]) {
+      assert.equal(isSearXNGWebSearchArgs({ query: 'test', result_detail: invalid }), false, String(invalid));
+    }
   }, results);
 
   await testFunction('isSearXNGWebSearchArgs rejects non-string categories', () => {
@@ -256,6 +294,10 @@ async function runTests() {
     assert.equal(properties.categories.type, 'string');
     assert.ok(properties.categories.description.includes('case-insensitively'), properties.categories.description);
     assert.ok(properties.categories.description.includes('/config'), properties.categories.description);
+    assert.ok(properties.categories.description.includes('common'), properties.categories.description);
+    assert.ok(properties.categories.description.includes('available'), properties.categories.description);
+    assert.ok(properties.categories.description.includes('forwarded'), properties.categories.description);
+    assert.ok(!properties.categories.description.includes('rejected'), properties.categories.description);
   }, results);
 
   await testFunction('WEB_SEARCH_TOOL schema includes engines property', () => {
@@ -263,6 +305,10 @@ async function runTests() {
     assert.ok(properties.engines, 'WEB_SEARCH_TOOL must expose engines parameter');
     assert.equal(properties.engines.type, 'string');
     assert.ok(properties.engines.description.includes('case-insensitively'), properties.engines.description);
+    assert.ok(properties.engines.description.includes('common'), properties.engines.description);
+    assert.ok(properties.engines.description.includes('available'), properties.engines.description);
+    assert.ok(properties.engines.description.includes('forwarded'), properties.engines.description);
+    assert.ok(!properties.engines.description.includes('rejected'), properties.engines.description);
     assert.ok(!properties.engines.description.includes('matched exactly'), properties.engines.description);
   }, results);
 
@@ -271,6 +317,25 @@ async function runTests() {
     assert.ok(properties.response_format, 'WEB_SEARCH_TOOL must expose response_format parameter');
     assert.equal(properties.response_format.type, 'string');
     assert.deepEqual(properties.response_format.enum, ['text', 'json']);
+    assert.equal('default' in properties.response_format, false);
+    assert.ok(!(WEB_SEARCH_TOOL.inputSchema.required as string[]).includes('response_format'));
+    assert.ok(
+      properties.response_format.description.includes('SEARXNG_DEFAULT_RESPONSE_FORMAT'),
+      properties.response_format.description,
+    );
+    assert.ok(
+      properties.response_format.description.includes('explicit response_format always takes precedence'),
+      properties.response_format.description,
+    );
+  }, results);
+
+  await testFunction('WEB_SEARCH_TOOL schema includes result_detail enum after response_format', () => {
+    const properties = WEB_SEARCH_TOOL.inputSchema.properties as Record<string, any>;
+    assert.deepEqual(Object.keys(properties).slice(-2), ['response_format', 'result_detail']);
+    assert.equal(properties.result_detail.type, 'string');
+    assert.deepEqual(properties.result_detail.enum, ['compact', 'full']);
+    assert.equal('default' in properties.result_detail, false);
+    assert.ok(properties.result_detail.description.includes('If omitted, full is used'));
   }, results);
 
   await testFunction('LITE_WEB_SEARCH_TOOL schema has only query property', () => {
@@ -289,6 +354,20 @@ async function runTests() {
     assert.equal(LITE_READ_URL_TOOL.name, 'web_url_read');
   }, results);
 
+  await testFunction('LITE_READ_URL_TOOL description mentions content-type-aware reads', () => {
+    assert.ok(LITE_READ_URL_TOOL.description.includes('HTML'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('JSON'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('YAML'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('TOML'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('XML'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('PDF'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('text extraction'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('binary'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('rejected'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('FlareSolverr first'), LITE_READ_URL_TOOL.description);
+    assert.ok(LITE_READ_URL_TOOL.description.includes('Byparr'), LITE_READ_URL_TOOL.description);
+  }, results);
+
   await testFunction('Full WEB_SEARCH_TOOL schema has multiple properties including language', () => {
     const props = WEB_SEARCH_TOOL.inputSchema.properties as Record<string, any>;
     assert.ok(props.query);
@@ -303,6 +382,22 @@ async function runTests() {
     assert.ok(props.url);
     assert.ok(props.maxLength, 'Full tool must expose maxLength parameter');
     assert.ok(Object.keys(props).length > 1, 'Full tool must have more than one property');
+  }, results);
+
+  await testFunction('READ_URL_TOOL description mentions supported content types and binary rejection', () => {
+    assert.ok(READ_URL_TOOL.description.includes('HTML'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('JSON'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('plain text'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('YAML'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('TOML'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('XML'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('PDF'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('text extraction'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('Binary'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('media'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('rejected'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('FlareSolverr first'), READ_URL_TOOL.description);
+    assert.ok(READ_URL_TOOL.description.includes('Byparr'), READ_URL_TOOL.description);
   }, results);
 
   await testFunction('isSearXNGSearchSuggestionsArgs accepts query and optional language', () => {
@@ -350,6 +445,9 @@ async function runTests() {
   await testFunction('INSTANCE_INFO_TOOL schema exposes capability controls', () => {
     const props = INSTANCE_INFO_TOOL.inputSchema.properties as Record<string, any>;
     assert.equal(INSTANCE_INFO_TOOL.name, 'searxng_instance_info');
+    assert.ok(INSTANCE_INFO_TOOL.description.includes('all reachable configured SearXNG instances'), INSTANCE_INFO_TOOL.description);
+    assert.ok(INSTANCE_INFO_TOOL.description.includes('common'), INSTANCE_INFO_TOOL.description);
+    assert.ok(INSTANCE_INFO_TOOL.description.includes('available'), INSTANCE_INFO_TOOL.description);
     assert.ok(props.includeEngines);
     assert.ok(props.includeDisabled);
     assert.ok(props.category);

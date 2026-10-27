@@ -3,17 +3,21 @@
  * Provides clear, focused error messages that identify the root cause
  */
 
+import { parseSearxngUrls, validateSearxngInstanceUrl } from "./searxng-instances.js";
+import { validateBrowserSolverEnvironment } from "./browser-solver-config.js";
+import { sanitizeErrorForTransport } from "./diagnostic-sanitizer.js";
+import { writeDiagnostic } from "./diagnostic-output.js";
+
 export interface ErrorContext {
   url?: string;
   searxngUrl?: string;
   proxyAgent?: boolean;
-  username?: string;
   timeout?: number;
   query?: string;
 }
 
 export class MCPSearXNGError extends Error {
-  constructor(message: string) {
+  constructor(message: string, public readonly expected = true) {
     super(message);
     this.name = 'MCPSearXNGError';
   }
@@ -109,12 +113,11 @@ export function createServerError(status: number, statusText: string, responseBo
   return new MCPSearXNGError(`🚫 ${target} Error (${status}): ${statusText}`);
 }
 
-export function createJSONError(responseText: string, context: ErrorContext): MCPSearXNGError {
-  const preview = responseText.substring(0, 100).replace(/\n/g, ' ');
-  return new MCPSearXNGError(`🔍 SearXNG Response Error: Invalid JSON format. Response: "${preview}..."`);
+export function createJSONError(_responseText: string): MCPSearXNGError {
+  return new MCPSearXNGError(`🔍 SearXNG Response Error: Invalid JSON format. Enable - json under search.formats in your SearXNG settings.yml, or set SEARXNG_HTML_FALLBACK=true.`);
 }
 
-export function createDataError(data: any, context: ErrorContext): MCPSearXNGError {
+export function createDataError(): MCPSearXNGError {
   return new MCPSearXNGError(`🔍 SearXNG Data Error: Missing results array in response`);
 }
 
@@ -137,7 +140,7 @@ export function createContentError(message: string, url: string): MCPSearXNGErro
   return new MCPSearXNGError(`📄 Content Error: ${message} (${url})`);
 }
 
-export function createConversionError(error: any, url: string, htmlContent: string): MCPSearXNGError {
+export function createConversionError(url: string): MCPSearXNGError {
   return new MCPSearXNGError(`🔄 Conversion Error: Cannot convert HTML to Markdown (${url})`);
 }
 
@@ -146,28 +149,48 @@ export function createTimeoutError(timeout: number, url: string): MCPSearXNGErro
   return new MCPSearXNGError(`⏱️ Timeout Error: ${hostname} took longer than ${timeout}ms to respond`);
 }
 
-export function createEmptyContentWarning(url: string, htmlLength: number, htmlPreview: string): string {
+export function createEmptyContentWarning(url: string): string {
   return `📄 Content Warning: Page fetched but appears empty after conversion (${url}). May contain only media or require JavaScript.`;
 }
 
 export function createUnexpectedError(error: any, context: ErrorContext): MCPSearXNGError {
-  return new MCPSearXNGError(`❓ Unexpected Error: ${error.message || String(error)}`);
+  return new MCPSearXNGError(`❓ Unexpected Error: ${error.message || String(error)}`, false);
+}
+
+/**
+ * Process-level crash handlers, registered by the CLI entrypoint (cli.ts).
+ *
+ * Extracted here so the logic is unit-testable: cli.ts calls main() at import
+ * time (it must always start the server — see issue #91), so it cannot be
+ * imported to test these in place.
+ */
+export function handleUncaughtException(error: unknown): void {
+  writeDiagnostic('error', 'Uncaught Exception:', sanitizeErrorForTransport(error));
+  process.exit(1);
+}
+
+export function handleUnhandledRejection(reason: unknown, promise: Promise<unknown>): void {
+  void promise;
+  writeDiagnostic('error', 'Unhandled Rejection:', sanitizeErrorForTransport(reason));
+  process.exit(1);
+}
+
+export function createDegradedSearchError(query: string, failures: string): MCPSearXNGError {
+  return new MCPSearXNGError(`🔍 Search Degraded: No results for "${query}", and these engines failed: ${failures}. Results may be incomplete — retry later or with other engines.`);
 }
 
 export function validateEnvironment(): string | null {
   const issues: string[] = [];
   
-  const searxngUrl = process.env.SEARXNG_URL;
-  if (!searxngUrl) {
+  const searxngUrls = parseSearxngUrls();
+  if (searxngUrls.length === 0) {
     issues.push("SEARXNG_URL not set");
   } else {
-    try {
-      const url = new URL(searxngUrl);
-      if (!['http:', 'https:'].includes(url.protocol)) {
-        issues.push(`SEARXNG_URL invalid protocol: ${url.protocol}`);
+    for (const [index, searxngUrl] of searxngUrls.entries()) {
+      const validationError = validateSearxngInstanceUrl(searxngUrl, index + 1);
+      if (validationError) {
+        issues.push(validationError);
       }
-    } catch (error) {
-      issues.push(`SEARXNG_URL invalid format: ${searxngUrl}`);
     }
   }
 
@@ -178,6 +201,11 @@ export function validateEnvironment(): string | null {
     issues.push("AUTH_USERNAME set but AUTH_PASSWORD missing");
   } else if (!authUsername && authPassword) {
     issues.push("AUTH_PASSWORD set but AUTH_USERNAME missing");
+  }
+
+  const browserSolverIssue = validateBrowserSolverEnvironment();
+  if (browserSolverIssue) {
+    issues.push(browserSolverIssue);
   }
 
   if (issues.length === 0) {

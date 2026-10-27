@@ -1,25 +1,39 @@
 # Deep Re SearXNG Documentation
 
-## User Guides
+Choose the task you want to complete. Start with the [README](../README.md) if
+you are connecting mcp-searxng for the first time.
 
-- **[README](../README.md)** — Quick start, installation, tool reference, and troubleshooting
-- **[CONFIGURATION](../CONFIGURATION.md)** — All environment variables with defaults and examples
+| I want to… | Guide |
+|---|---|
+| Run the bundled search stack and deep-research skills | [Deep research setup](deep-research.md) |
+| Connect my MCP client | [Client recipes](client-configurations.md) |
+| Search and read a source | [Tools and examples](tools.md) |
+| Diagnose a failure | [Troubleshooting](troubleshooting.md) |
+| Run a shared HTTP service | [HTTP server setup](http-server.md) |
+| Configure my SearXNG service | [Self-hosted SearXNG](self-hosted-searxng.md) |
+| Get more useful search results | [Tested search configuration](search-configuration.md) |
+| Deploy search with optional browsers | [SearXNG and solver deployment](browser-solver-deployment.md) |
+| Use someone else's SearXNG instance | [Public-instance guidance](public-searxng-instances.md) |
+| Look up a setting or default | [Configuration reference](../CONFIGURATION.md) |
+| Understand security boundaries | [Security](../SECURITY.md) |
+| Research and cite evidence | [Research workflow](research-workflow.md) |
+| Assess resource needs | [Historical deployment measurements](deployment-profiles.md) |
+| Check previously exercised solver versions | [Browser solver verification](browser-solver-verification.md) |
+| Inspect the current configuration test results | [Dated configuration evidence](search-configuration-verification.md) |
 
-## Topics
+## Installation
 
-### Installation
-See [README § Installation](../README.md#installation) for setup instructions for Claude Desktop, Cursor, VS Code, and Docker.
+Choose [local installation](../README.md#installation) or [HTTP setup](http-server.md).
 
-### Configuration
-See [CONFIGURATION.md](../CONFIGURATION.md) for all supported environment variables:
-- `SEARXNG_URL` — SearXNG instance URL (required)
-- `MCP_HTTP_PORT` / `MCP_HTTP_HOST` — HTTP transport settings
-- `MCP_HTTP_AUTH_TOKEN` — Bearer token authentication
-- `MCP_RATE_*` — Rate limiting controls
-- `HTTPS_PROXY` / `NO_PROXY` — Proxy settings
+## Configuration
 
-### Tools
-See [README § Tools](../README.md#tools) for the `searxng_web_search` and `web_url_read` tool reference.
+[CONFIGURATION.md](../CONFIGURATION.md) owns environment-variable defaults and
+limits. Guides link to that reference instead of defining competing defaults.
 
-### Security
-See [SECURITY.md](../SECURITY.md) for the vulnerability reporting policy.
+## Tools
+
+[Tool reference](tools.md) and [troubleshooting](troubleshooting.md).
+
+## Security
+
+[Security policy and deployment guidance](../SECURITY.md).

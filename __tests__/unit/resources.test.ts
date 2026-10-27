@@ -14,6 +14,26 @@ import { EnvManager } from '../helpers/env-utils.js';
 
 const results = createTestResults();
 const envManager = new EnvManager();
+const proxyEnvironmentKeys = [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'SEARCH_HTTP_PROXY',
+  'SEARCH_HTTPS_PROXY',
+  'search_http_proxy',
+  'search_https_proxy',
+  'URL_READER_HTTP_PROXY',
+  'URL_READER_HTTPS_PROXY',
+  'url_reader_http_proxy',
+  'url_reader_https_proxy',
+] as const;
+
+function clearProxyEnvironment() {
+  for (const key of proxyEnvironmentKeys) {
+    envManager.delete(key);
+  }
+}
 
 async function runTests() {
   console.log('🧪 Testing: resources.ts\n');
@@ -36,7 +56,7 @@ async function runTests() {
     // Check that config includes environment information
     assert.ok(parsed.environment);
     assert.ok(parsed.environment.searxngUrl || parsed.environment.hasOwnProperty('searxngUrl'));
-    assert.ok(parsed.environment.currentLogLevel || parsed.environment.hasOwnProperty('currentLogLevel'));
+    assert.equal(parsed.environment.currentLogLevel, 'info');
   }, results);
 
   await testFunction('createHelpResource returns markdown string', () => {
@@ -51,6 +71,13 @@ async function runTests() {
     
     // Should include information about tools
     assert.ok(help.includes('searxng') || help.includes('search') || help.includes('SearXNG'));
+  }, results);
+
+  await testFunction('help resource names the optional MCP Streamable HTTP transport', () => {
+    const help = createHelpResource();
+
+    assert.ok(help.includes('MCP Streamable HTTP transport'));
+    assert.ok(!help.includes('RESTful HTTP transport'));
   }, results);
 
   await testFunction('config resource advertises all registered tools', () => {
@@ -71,10 +98,30 @@ async function runTests() {
     assert.ok(help.includes('`num_results`'), 'missing num_results parameter');
     assert.ok(help.includes('`categories`'), 'missing categories parameter');
     assert.ok(help.includes('`response_format`'), 'missing response_format parameter');
+    assert.ok(help.includes('`result_detail`'), 'missing result_detail parameter');
+    assert.ok(help.includes('`SEARXNG_DEFAULT_RESPONSE_FORMAT`'), 'missing response-format environment default');
+    assert.ok(help.includes('`text` or `json`'), 'missing accepted response-format values');
+    assert.ok(help.includes('if unset or invalid, text is used'), 'missing text fallback');
+    assert.ok(help.includes('explicit `response_format` always takes precedence'), 'missing explicit precedence');
     assert.ok(help.includes('metadata sections'), 'missing metadata/direct-answer output note');
+    assert.ok(help.includes('Lite schema stays query-only'), 'missing Lite query-only boundary');
+    assert.ok(help.includes('explicitly supplied optional overrides'), 'missing Lite override behavior');
+    assert.ok(help.includes('all four text/JSON and compact/full combinations'), 'missing result-content cap scope');
+    assert.ok(help.includes('retaining engine-failure diagnostics'), 'missing compact suppression boundary');
+    assert.ok(help.includes('full text optional lines'), 'missing full metadata ordering guidance');
+    assert.ok(help.includes('text fields are normalized to single lines'), 'missing text line-normalization guidance');
+    assert.ok(help.includes('JSON caps the original string value'), 'missing compact truncation-order guidance');
     assert.ok(help.includes('### 2. searxng_search_suggestions'), 'missing suggestions tool section');
     assert.ok(help.includes('### 3. searxng_instance_info'), 'missing instance info tool section');
     assert.ok(help.includes('### 4. web_url_read'), 'missing URL reader tool section');
+  }, results);
+
+  await testFunction('help resource recommends URL userinfo for SearXNG Basic Auth', () => {
+    const help = createHelpResource();
+
+    assert.ok(help.includes('https://user:password@search.example.com'), 'missing URL userinfo auth example');
+    assert.ok(help.includes('percent-encode'), 'missing percent-encoding note');
+    assert.ok(help.includes('Legacy global Basic Auth fallback'), 'missing legacy AUTH_* fallback note');
   }, results);
 
   await testFunction('createConfigResource - hasAuth true when both credentials set', () => {
@@ -90,6 +137,7 @@ async function runTests() {
   await testFunction('createConfigResource - hasAuth false when credentials absent', () => {
     envManager.delete('AUTH_USERNAME');
     envManager.delete('AUTH_PASSWORD');
+    envManager.set('SEARXNG_URL', 'https://search.example.com');
 
     const config = JSON.parse(createConfigResource());
     assert.equal(config.environment.hasAuth, false);
@@ -97,20 +145,52 @@ async function runTests() {
     envManager.restore();
   }, results);
 
-  await testFunction('createConfigResource - hasProxy true when HTTP_PROXY set', () => {
-    envManager.set('HTTP_PROXY', 'http://proxy:8080');
+  await testFunction('createConfigResource - hasAuth true when SEARXNG_URL carries userinfo without global AUTH_*', () => {
+    envManager.delete('AUTH_USERNAME');
+    envManager.delete('AUTH_PASSWORD');
+    envManager.set('SEARXNG_URL', 'https://token@search.example.com');
 
     const config = JSON.parse(createConfigResource());
-    assert.equal(config.environment.hasProxy, true);
+    assert.equal(config.environment.hasAuth, true);
 
     envManager.restore();
   }, results);
 
+  await testFunction('createConfigResource - redacts embedded userinfo from searxngUrl (non-hardened)', () => {
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.set('SEARXNG_URL', 'https://user:p%40ss@search.example.com;https://public.example.com');
+
+    const config = JSON.parse(createConfigResource());
+    assert.ok(config.environment.searxngUrl, 'expected searxngUrl to be exposed in non-hardened mode');
+    // Parse each entry and assert on the exact host so a leaked credential can't
+    // hide in a substring, and no userinfo survives redaction.
+    const entries = config.environment.searxngUrl.split('; ').map((entry: string) => new URL(entry));
+    assert.equal(entries.length, 2);
+    assert.equal(entries[0].hostname, 'search.example.com');
+    assert.equal(entries[0].username, '');
+    assert.equal(entries[0].password, '');
+    assert.equal(entries[1].hostname, 'public.example.com');
+    assert.ok(!config.environment.searxngUrl.includes('p%40ss'), config.environment.searxngUrl);
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('createConfigResource - hasProxy true for every supported proxy variable', () => {
+    try {
+      for (const key of proxyEnvironmentKeys) {
+        clearProxyEnvironment();
+        envManager.set(key, 'http://proxy:8080');
+
+        const config = JSON.parse(createConfigResource());
+        assert.equal(config.environment.hasProxy, true, `expected ${key} to be reported`);
+      }
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
   await testFunction('createConfigResource - hasProxy false when no proxy set', () => {
-    envManager.delete('HTTP_PROXY');
-    envManager.delete('HTTPS_PROXY');
-    envManager.delete('http_proxy');
-    envManager.delete('https_proxy');
+    clearProxyEnvironment();
 
     const config = JSON.parse(createConfigResource());
     assert.equal(config.environment.hasProxy, false);

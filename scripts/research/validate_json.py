@@ -51,28 +51,51 @@ class ValidationResult(TypedDict):
 def load_fields_yaml(fields_path: Path) -> FieldSchema:
     """Load fields.yaml and return normalized field sets."""
     with fields_path.open(encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+        data = yaml.safe_load(handle)
+    if not isinstance(data, dict) or not isinstance(data.get("field_categories"), list):
+        raise ValueError("expected a field_categories list in fields.yaml")
+    if not data["field_categories"]:
+        raise ValueError("fields.yaml must define at least one field category")
 
     all_fields: set[str] = set()
     required_fields: set[str] = set()
     field_categories: dict[str, str] = {}
     category_mapping = {key: list(value) for key, value in CATEGORY_MAPPING.items()}
+    has_required_markers = False
 
-    for category in data.get("field_categories", []):
-        category_name = str(category.get("category", "Unknown"))
+    for category in data["field_categories"]:
+        if not isinstance(category, dict):
+            raise ValueError("each field category must be an object")
+        category_name = category.get("category")
+        fields = category.get("fields")
+        if not isinstance(category_name, str) or not category_name.strip():
+            raise ValueError("each field category needs a nonempty category name")
+        if not isinstance(fields, list) or not fields:
+            raise ValueError(f"category {category_name!r} needs a nonempty fields list")
         category_slug = slugify_category(category_name)
         category_mapping.setdefault(category_slug, [])
         for alias in (category_slug, category_name):
             if alias not in category_mapping[category_slug]:
                 category_mapping[category_slug].append(alias)
-        for field in category.get("fields", []):
+        for field in fields:
+            if not isinstance(field, dict):
+                raise ValueError("each field must be an object with a name")
             name = field.get("name")
-            if not isinstance(name, str) or not name:
-                continue
+            if not isinstance(name, str) or not name.strip() or name in SKIP_KEYS:
+                raise ValueError(f"invalid or reserved field name: {name!r}")
+            if name in all_fields:
+                raise ValueError(f"duplicate field name: {name}")
             all_fields.add(name)
             field_categories[name] = category_name
-            if bool(field.get("required", False)):
+            if "required" in field:
+                has_required_markers = True
+                if not isinstance(field["required"], bool):
+                    raise ValueError(f"required must be a Boolean for field {name!r}")
+            if field.get("required", False):
                 required_fields.add(name)
+
+    if not has_required_markers:
+        required_fields = set(all_fields)
 
     return {
         "all_fields": all_fields,
@@ -123,6 +146,8 @@ def validate_json(json_path: Path, schema: FieldSchema) -> ValidationResult:
     """Validate one JSON result file."""
     with json_path.open(encoding="utf-8") as handle:
         data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("a research result must be a JSON object")
 
     all_fields = schema["all_fields"]
     required_fields = schema["required_fields"]
@@ -224,27 +249,28 @@ def main() -> int:
 
     try:
         fields_path = resolve_fields_path(args.fields)
-    except FileNotFoundError as exc:
+        schema = load_fields_yaml(fields_path)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
         print(f"[ERROR] {exc}")
         return 1
 
     print(f"Field definition file: {fields_path}")
-    schema = load_fields_yaml(fields_path)
     total_fields = len(schema["all_fields"])
     total_required = len(schema["required_fields"])
     print(f"Total fields: {total_fields} (required: {total_required}, optional: {total_fields - total_required})")
 
     json_files = collect_json_files(args)
     if not json_files:
-        print("[WARN] No JSON files found")
-        return 0
+        print("[ERROR] No JSON files found")
+        return 1
 
     results: list[ValidationResult] = []
     for json_path in json_files:
-        if not json_path.exists():
-            print(f"[WARN] File not found: {json_path}")
+        try:
+            result = validate_json(json_path, schema)
+        except (OSError, ValueError) as exc:
+            print(f"[ERROR] {json_path}: {exc}")
             continue
-        result = validate_json(json_path, schema)
         results.append(result)
         print_result(result, verbose=not args.quiet)
 
@@ -254,10 +280,10 @@ def main() -> int:
     print(line)
     passed = sum(1 for result in results if result["valid"])
     avg_coverage = sum(result["coverage_rate"] for result in results) / len(results) if results else 0.0
-    print(f"Validation passed: {passed}/{len(results)}")
+    print(f"Validation passed: {passed}/{len(json_files)}")
     print(f"Average coverage: {avg_coverage:.1f}%")
 
-    return 0 if passed == len(results) else 1
+    return 0 if passed == len(json_files) else 1
 
 
 if __name__ == "__main__":

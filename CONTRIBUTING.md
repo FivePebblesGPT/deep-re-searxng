@@ -1,35 +1,81 @@
-# Contributing
+# Contributing to mcp-searxng
 
-Deep Re SearXNG is a local combined distribution of:
+We welcome contributions! Follow these guidelines to get started.
 
-- a TypeScript SearXNG MCP server
-- repo-scoped Codex Deep Research skills
-- a bundled local Docker Compose runtime
+Please read and follow the [Code of Conduct](CODE_OF_CONDUCT.md) when participating in this project.
 
-## Development
+## Supported distribution methods
+
+The project maintains **npm** (including **npx**) and **Docker** distribution.
+Additional package formats, including Nix, should be maintained separately by
+the community in an external package or repository that tracks upstream releases.
+Keep additional packaging and its build or release tooling out of project PRs.
+
+## Getting Started
 
 ```bash
-npm ci
-npm run lint
+git clone https://github.com/YOUR_USERNAME/mcp-searxng.git
+cd mcp-searxng
+git remote add upstream https://github.com/ihor-sokoliuk/mcp-searxng.git
+npm install
+```
+
+## Development Workflow
+
+```bash
+npm run watch   # Watch mode — rebuilds on file changes
+npm run build   # One-off build
+```
+
+## Coding Standards
+
+- Use TypeScript with strict type safety
+- Follow existing error handling patterns
+- Write concise, informative error messages
+- Include unit tests for new functionality
+- Keep coverage above the enforced gate — **90% lines, 85% branches** (CI runs `npm run test:coverage` and fails below it)
+- Run `npm run lint` (or `npm run security` for lint + dependency audit) before submitting
+- Test with the MCP inspector (`npm run inspector`) before submitting
+
+## Testing
+
+```bash
+npm test                  # Run all tests
+npm run test:coverage     # Generate coverage report
+```
+
+For release workflow changes, see [MCP Registry publication](docs/registry-publication.md)
+for the independent registry workflow, retry behavior, recovery, and offline tests.
+
+## Submitting a PR
+
+```bash
+git checkout -b feature/your-feature-name
+# Make changes in src/
 npm run build
 npm test
-docker compose config
+npm run test:coverage
+npm run inspector
+git commit -m "feat: description"
+git push origin feature/your-feature-name
+# Open a PR on GitHub
 ```
 
-For Python research helpers:
+## Documentation changes
 
-```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python scripts/research/validate_json.py --help
-```
+Write for a reader completing a task. Keep configuration defaults in
+[CONFIGURATION.md](CONFIGURATION.md), tool arguments in [the tool guide](docs/tools.md),
+client setup in [the cookbook](docs/client-configurations.md), and failure
+diagnosis in [troubleshooting](docs/troubleshooting.md). Update affected
+built-in help when behavior changes; link to detail instead of copying it.
 
-Keep the four MCP tool names stable unless a breaking change is intentional:
+Check examples, local links and existing anchors when moving content. Record
+whether client guidance was checked against its official schema or actually
+exercised, with the date and known versions. Do not describe unreleased
+behavior as available to installed-package users. Preserve dated historical
+verification results with their limitations.
 
-- `searxng_web_search`
-- `searxng_search_suggestions`
-- `searxng_instance_info`
-- `web_url_read`
-
-When changing skills, keep `SKILL.md` descriptions short and include clear `Use when` trigger language.
+In each PR, state what is included and intentionally out of scope. Record
+validation as example/area, check, environment/version and result or limitation.
+Use focused documentation tests for prose changes; include build/resource or
+handler checks when embedded help or a behavior claim needs verification.

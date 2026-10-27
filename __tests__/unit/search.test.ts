@@ -7,17 +7,38 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { performWebSearch } from '../../src/search.js';
+import { performWebSearch, formatCachedSearchResult, getSearchTimeoutMs } from '../../src/search.js';
+import { searchCache } from '../../src/search-cache.js';
 import { clearInstanceInfoCacheForTests } from '../../src/instance-info.js';
+import {
+  clearSearxngInstanceStateForTests,
+  isSearxngInstanceCooledDown,
+  recordSearxngInstanceFailure,
+} from '../../src/searxng-instances.js';
 import { testFunction, createTestResults, printTestSummary } from '../helpers/test-utils.js';
-import { createMockServer } from '../helpers/mock-server.js';
+import { createMockServer, createMockServerWithTracking } from '../helpers/mock-server.js';
 import { FetchMocker, createMockFetch, createCapturingMockFetch, createAbortableMockFetch } from '../helpers/mock-fetch.js';
 import { EnvManager } from '../helpers/env-utils.js';
 
 const results = createTestResults();
 const fetchMocker = new FetchMocker();
 const envManager = new EnvManager();
+const searxngHtmlFixture = readFileSync('__tests__/fixtures/searxng-results.html', 'utf8');
+
+async function withControlledClock(
+  fn: (advance: (ms: number) => void) => void | Promise<void>,
+): Promise<void> {
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  try {
+    await fn((ms) => { now += ms; });
+  } finally {
+    Date.now = realNow;
+  }
+}
 
 function makeMockSearchResults(count: number) {
   return Array.from({ length: count }, (_, index) => ({
@@ -28,19 +49,175 @@ function makeMockSearchResults(count: number) {
   }));
 }
 
+const METADATA_RESULT_ROW = {
+  title: 'Real Result',
+  content: 'Computing pioneer',
+  url: 'https://example.com/result',
+  score: 0.8,
+};
+
+/**
+ * Run one search whose response carries the given metadata, and return the text.
+ *
+ * Every metadata test needs the same scaffolding — point SEARXNG_URL at the test
+ * instance, mock one successful response with a single result row, search, then
+ * put both back — so it is written once here. Restoring in a finally block also
+ * means a failed assertion cannot leak the fetch mock or the env var into the
+ * tests that run after it.
+ */
+async function searchWithMetadata(query: string, metadata: Record<string, unknown>): Promise<string> {
+  envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+  fetchMocker.mock(createMockFetch({
+    json: { query, number_of_results: 1, results: [METADATA_RESULT_ROW], ...metadata },
+  }));
+
+  try {
+    return await performWebSearch(createMockServer() as any, query);
+  } finally {
+    fetchMocker.restore();
+    envManager.restore();
+  }
+}
+
 function makeConfigWithEngines() {
   return {
     categories: ['general', 'news', 'social media'],
     engines: [
-      { name: 'google', disabled: false },
-      { name: 'ddg', disabled: false },
-      { name: 'bing', disabled: true },
-      { name: 'semantic scholar', disabled: false },
+      { name: 'google', disabled: false, time_range_support: true },
+      { name: 'ddg', disabled: false, time_range_support: true },
+      { name: 'github', disabled: false, time_range_support: false },
+      { name: 'bing', disabled: true, time_range_support: true },
+      { name: 'semantic scholar', disabled: false, time_range_support: false },
     ],
   };
 }
 
+function getSingleResponseFormatWarning(calls: any[]): string {
+  const warnings = calls.filter((call) => call.level === 'warning');
+  assert.equal(warnings.length, 1);
+  const message = String(warnings[0].data?.message ?? '');
+  assert.ok(message.includes('SEARXNG_DEFAULT_RESPONSE_FORMAT'), message);
+  assert.ok(message.includes('text or json'), message);
+  return message;
+}
+
+function createStreamResponse(
+  chunks: Uint8Array[],
+  options: { status?: number; statusText?: string; errorAfterChunks?: boolean } = {},
+): Response {
+  let index = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index++]);
+        return;
+      }
+      if (options.errorAfterChunks) {
+        controller.error(new Error('partial response stream failed'));
+        return;
+      }
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    status: options.status ?? 200,
+    statusText: options.statusText ?? 'OK',
+  });
+}
+
+function utf8(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
+}
+
 async function runTests() {
+  await testFunction('page fanout is parallel, ordered and deduplicated before the result limit', async () => {
+    envManager.set('SEARXNG_URL', 'https://search.example.com');
+    envManager.set('SEARXNG_MAX_RESULTS', '3');
+    searchCache.clear();
+    const requested: number[] = [];
+    let release!: () => void;
+    const bothStarted = new Promise<void>(resolve => { release = resolve; });
+    fetchMocker.mock(async (input) => {
+      const page = Number(new URL(String(input)).searchParams.get('pageno'));
+      requested.push(page);
+      if (requested.length === 2) release();
+      await bothStarted;
+      const results = [
+        { title: 'shared', content: 'same', url: 'https://example.com/shared' },
+        { title: `page-${page}`, content: 'result', url: `https://example.com/${page}` },
+      ];
+      return createMockFetch({ json: { results, number_of_results: 999, suggestions: [`page-${page}`] } })(input);
+    });
+    try {
+      const value = JSON.parse(await performWebSearch(createMockServer() as any, 'page-parallel', 3,
+        undefined, undefined, undefined, undefined, 8, undefined, undefined, 'json', 'full', 2));
+      assert.deepEqual(requested, [3, 4]);
+      assert.deepEqual(value.results.map((entry: { title: string }) => entry.title), ['shared', 'page-3', 'page-4']);
+      assert.equal(value.failedPages, undefined);
+      assert.equal(value.number_of_results, 999, 'retain the upstream estimate rather than the merged count');
+      assert.deepEqual(value.suggestions, ['page-3', 'page-4']);
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
+  }, results);
+
+  await testFunction('page failures retain successful results, expose only page numbers and are not cached', async () => {
+    envManager.set('SEARXNG_URL', 'https://search.example.com');
+    searchCache.clear();
+    const requested: number[] = [];
+    fetchMocker.mock(async (input) => {
+      const page = Number(new URL(String(input)).searchParams.get('pageno'));
+      requested.push(page);
+      if (page === 2) throw new Error('untrusted failure detail');
+      return createMockFetch({ json: { results: makeMockSearchResults(1) } })(input);
+    });
+    try {
+      for (const detail of ['compact', 'full'] as const) {
+        for (let i = 0; i < 2; i++) {
+          const value = JSON.parse(await performWebSearch(createMockServer() as any, 'page-partial', 1,
+            undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', detail, 2));
+          assert.equal(value.results.length, 1);
+          assert.deepEqual(value.failedPages, [2]);
+          assert.ok(!JSON.stringify(value).includes('untrusted failure detail'));
+        }
+      }
+      assert.equal(requested.length, 8);
+      const text = await performWebSearch(createMockServer() as any, 'page-partial-text', 1,
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'compact', 2);
+      assert.match(text, /Search pages unavailable: 2/);
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
+  }, results);
+
+  await testFunction('page count and start page separate cache entries and direct calls cap fanout at five', async () => {
+    envManager.set('SEARXNG_URL', 'https://search.example.com');
+    searchCache.clear();
+    const requested: number[] = [];
+    fetchMocker.mock(async (input) => {
+      const page = Number(new URL(String(input)).searchParams.get('pageno'));
+      requested.push(page);
+      return createMockFetch({ json: { results: [{ title: `page-${page}`, content: 'result', url: `https://example.com/${page}` }] } })(input);
+    });
+    const search = (start: number, pages: number) => performWebSearch(createMockServer() as any, 'page-cache', start,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'compact', pages);
+    try {
+      await search(1, 1); await search(1, 2); await search(2, 2); await search(1, 2);
+      assert.deepEqual(requested, [1, 1, 2, 2, 3]);
+      requested.length = 0;
+      await search(10, 6);
+      assert.deepEqual(requested, [10, 11, 12, 13, 14]);
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
+  }, results);
+
+  await testFunction('all failed pages remain a search error', async () => {
+    envManager.set('SEARXNG_URL', 'https://search.example.com');
+    searchCache.clear();
+    let calls = 0;
+    fetchMocker.mock(async () => { calls++; throw new Error('failed upstream'); });
+    try {
+      await assert.rejects(performWebSearch(createMockServer() as any, 'page-all-failed', 1,
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'compact', 2));
+      assert.equal(calls, 2);
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
+  }, results);
+
   console.log('🧪 Testing: search.ts\n');
 
   await testFunction('Error handling for missing SEARXNG_URL', async () => {
@@ -92,7 +269,7 @@ async function runTests() {
 
     // Verify URL construction
     const url = new URL(getCapturedUrl());
-    assert.ok(url.pathname.includes('/search'));
+    assert.equal(url.pathname, '/search');
     assert.ok(url.searchParams.get('q') === 'test query');
     assert.ok(url.searchParams.get('pageno') === '2');
     assert.ok(url.searchParams.get('time_range') === 'day');
@@ -148,7 +325,7 @@ async function runTests() {
     }
 
     let url = new URL(capture.getCapturedUrl());
-    assert.ok(url.pathname.includes('/subpath/search'), `Expected path to contain /instance/search, got ${url.pathname}`);
+    assert.equal(url.pathname, '/subpath/search');
     
     fetchMocker.restore();
 
@@ -169,7 +346,7 @@ async function runTests() {
     }
 
     url = new URL(capture.getCapturedUrl());
-    assert.ok(url.pathname.includes('/subpath/search'), `Expected path to contain /instance/search, got ${url.pathname}`);
+    assert.equal(url.pathname, '/subpath/search');
 
     fetchMocker.restore();
     envManager.restore();
@@ -198,8 +375,76 @@ async function runTests() {
     const options = getCapturedOptions();
     assert.ok(options?.headers);
     const headers = options.headers as Record<string, string>;
-    assert.ok(headers['Authorization']);
-    assert.ok(headers['Authorization'].startsWith('Basic '));
+    assert.equal(headers['authorization'], `Basic ${Buffer.from('testuser:testpass').toString('base64')}`);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('embedded URL auth overrides global auth for search requests', async () => {
+    envManager.set('SEARXNG_URL', 'https://embedded:p%40ss@test-searx.example.com');
+    envManager.set('AUTH_USERNAME', 'global-user');
+    envManager.set('AUTH_PASSWORD', 'global-pass');
+
+    const mockServer = createMockServer();
+    const { mockFetch, getCapturedOptions } = createCapturingMockFetch();
+
+    fetchMocker.mock(async (url, options) => {
+      await mockFetch(url, options);
+      return createMockFetch({ json: { results: [] } })(url, options);
+    });
+
+    await performWebSearch(mockServer as any, 'test query');
+
+    const headers = getCapturedOptions()?.headers as Record<string, string>;
+    assert.equal(headers['authorization'], `Basic ${Buffer.from('embedded:p@ss').toString('base64')}`);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('search fetch URL strips embedded credentials before request', async () => {
+    envManager.set('SEARXNG_URL', 'https://user:pass@test-searx.example.com/subpath');
+
+    const mockServer = createMockServer();
+    const { mockFetch, getCapturedUrl } = createCapturingMockFetch();
+
+    fetchMocker.mock(async (url, options) => {
+      await mockFetch(url, options);
+      return createMockFetch({ json: { results: [] } })(url, options);
+    });
+
+    await performWebSearch(mockServer as any, 'test query');
+
+    const capturedUrl = getCapturedUrl();
+    const parsedUrl = new URL(capturedUrl);
+    assert.equal(parsedUrl.username, '');
+    assert.equal(parsedUrl.password, '');
+    assert.equal(parsedUrl.hostname, 'test-searx.example.com');
+    assert.equal(parsedUrl.pathname, '/subpath/search');
+    assert.ok(!capturedUrl.includes('user:pass@'), capturedUrl);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('search request omits Authorization when no credentials are configured', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.delete('AUTH_USERNAME');
+    envManager.delete('AUTH_PASSWORD');
+
+    const mockServer = createMockServer();
+    const { mockFetch, getCapturedOptions } = createCapturingMockFetch();
+
+    fetchMocker.mock(async (url, options) => {
+      await mockFetch(url, options);
+      return createMockFetch({ json: { results: [] } })(url, options);
+    });
+
+    await performWebSearch(mockServer as any, 'test query');
+
+    const headers = (getCapturedOptions()?.headers || {}) as Record<string, string>;
+    assert.equal(headers['authorization'], undefined);
 
     fetchMocker.restore();
     envManager.restore();
@@ -239,20 +484,235 @@ async function runTests() {
     
     const mockServer = createMockServer();
     
-    fetchMocker.mock(async () => ({
-      ok: true,
-      json: async () => {
-        throw new Error('Invalid JSON');
-      },
-      text: async () => 'Invalid JSON response'
-    } as any));
+    fetchMocker.mock(async () => new Response('Invalid JSON response'));
 
     try {
       await performWebSearch(mockServer as any, 'test query');
       assert.fail('Should have thrown JSON parsing error');
     } catch (error: any) {
-      assert.ok(error.message.includes('JSON Error') || error.message.includes('Invalid JSON') || error.name === 'MCPSearXNGError');
+      assert.equal(error.name, 'MCPSearXNGError');
+      // Upstream previews can contain escaped or truncated authentication.
+      assert.ok(
+        !error.message.includes('Invalid JSON response'),
+        `unexpected upstream preview in error message: ${error.message}`
+      );
+      assert.ok(
+        error.message.includes('- json'),
+        `expected SearXNG JSON format remediation in error message, got: ${error.message}`
+      );
+      assert.ok(
+        error.message.includes('search.formats'),
+        `expected SearXNG JSON format remediation in error message, got: ${error.message}`
+      );
+      assert.ok(
+        error.message.includes('SEARXNG_HTML_FALLBACK=true'),
+        `expected HTML fallback remediation in error message, got: ${error.message}`
+      );
     }
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('HTML fallback triggers on 403 when enabled and refetches without format=json', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_HTML_FALLBACK', 'true');
+
+    const mockServer = createMockServer();
+    const requestedUrls: string[] = [];
+    fetchMocker.mock(async (url) => {
+      requestedUrls.push(url.toString());
+
+      const requestUrl = new URL(url.toString());
+      if (requestUrl.pathname.endsWith('/config')) {
+        return new Response(JSON.stringify({ categories: ['general'], engines: [] }));
+      }
+
+      if (requestUrl.searchParams.get('format') === 'json') {
+        return new Response('JSON format is disabled', { status: 403, statusText: 'Forbidden' });
+      }
+
+      return new Response(searxngHtmlFixture);
+    });
+
+    const result = await performWebSearch(mockServer as any, 'html query', 2, 'week', 'en', 1, undefined, undefined, 'general', undefined, 'json');
+    const payload = JSON.parse(result);
+
+    const searchUrls = requestedUrls.filter((requestedUrl) => new URL(requestedUrl).pathname.endsWith('/search'));
+    assert.equal(searchUrls.length, 2);
+    const jsonUrl = new URL(searchUrls[0]);
+    const htmlUrl = new URL(searchUrls[1]);
+    assert.equal(jsonUrl.searchParams.get('format'), 'json');
+    assert.equal(htmlUrl.searchParams.get('format'), null);
+    assert.equal(htmlUrl.searchParams.get('q'), 'html query');
+    assert.equal(htmlUrl.searchParams.get('pageno'), '2');
+    assert.equal(htmlUrl.searchParams.get('time_range'), 'week');
+    assert.equal(htmlUrl.searchParams.get('language'), 'en');
+    assert.equal(htmlUrl.searchParams.get('safesearch'), '1');
+    assert.equal(htmlUrl.searchParams.get('categories'), 'general');
+    assert.equal(payload.sourceFormat, 'html');
+    assert.equal(payload.results.length, 2);
+    assert.deepEqual(payload.results[0], {
+      title: 'Alpha Result',
+      url: 'https://example.com/alpha',
+      content: 'Alpha result snippet from a SearXNG simple theme result page.',
+    });
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('HTML fallback retry log redacts credential-bearing configured URL', async () => {
+    envManager.set('SEARXNG_URL', 'https://user:pass@fallback-log.example.com');
+    envManager.set('SEARXNG_HTML_FALLBACK', 'true');
+
+    const { server, getLoggingCalls } = createMockServerWithTracking();
+    fetchMocker.mock(async (url) => {
+      const requestUrl = new URL(url.toString());
+
+      if (requestUrl.searchParams.get('format') === 'json') {
+        return new Response('JSON format is disabled', { status: 403, statusText: 'Forbidden' });
+      }
+
+      return new Response(searxngHtmlFixture);
+    });
+
+    await performWebSearch(server as any, 'fallback log');
+
+    const fallbackLog = getLoggingCalls()
+      .map((call) => call.data?.message)
+      .find((message) => typeof message === 'string' && message.includes('Retrying search with HTML fallback:'));
+    assert.ok(fallbackLog, 'Expected HTML fallback retry log');
+    assert.match(fallbackLog, /^Retrying search with HTML fallback: https:\/\/fallback-log\.example\.com\//);
+    assert.ok(!fallbackLog.includes('user:pass@'), fallbackLog);
+    assert.ok(!fallbackLog.includes('pass'), fallbackLog);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('HTML fallback triggers on 200 non-JSON body when enabled', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_HTML_FALLBACK', 'true');
+
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async () => {
+      fetchCount++;
+      if (fetchCount === 1) {
+        return new Response('<!doctype html><html><body>JSON disabled</body></html>');
+      }
+
+      return new Response(searxngHtmlFixture);
+    });
+
+    const result = await performWebSearch(mockServer as any, 'non json query', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const payload = JSON.parse(result);
+
+    assert.equal(fetchCount, 2);
+    assert.equal(payload.sourceFormat, 'html');
+    assert.equal(payload.results[1].title, 'Beta Result');
+    assert.equal(payload.results[1].url, 'https://example.com/beta');
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('HTML fallback on 200 non-JSON body strips embedded credentials from the refetch URL', async () => {
+    envManager.set('SEARXNG_URL', 'https://user:p%40ss@test-searx.example.com');
+    envManager.set('SEARXNG_HTML_FALLBACK', 'true');
+
+    const mockServer = createMockServer();
+    const fetchedUrls: string[] = [];
+    fetchMocker.mock(async (url) => {
+      fetchedUrls.push(url.toString());
+      if (fetchedUrls.length === 1) {
+        return new Response('<!doctype html><html><body>JSON disabled</body></html>');
+      }
+
+      return new Response(searxngHtmlFixture);
+    });
+
+    await performWebSearch(mockServer as any, 'non json creds', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+
+    assert.equal(fetchedUrls.length, 2);
+    // Neither the initial fetch nor the HTML-fallback refetch may carry userinfo —
+    // Node's fetch rejects credential-bearing URLs outright.
+    for (const fetched of fetchedUrls) {
+      assert.equal(new URL(fetched).username, '');
+      assert.ok(!fetched.includes('user:p%40ss@'), fetched);
+    }
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('403 without HTML fallback enabled returns original error and does not refetch', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.delete('SEARXNG_HTML_FALLBACK');
+
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async () => {
+      fetchCount++;
+      return new Response('JSON format is disabled', { status: 403, statusText: 'Forbidden' });
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'test query');
+      assert.fail('Expected original 403 error');
+    } catch (error: any) {
+      assert.ok(error.message.includes('403') || error.message.includes('Server Error'));
+    }
+    assert.equal(fetchCount, 1);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('401 with HTML fallback enabled returns original error and does not refetch', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_HTML_FALLBACK', 'true');
+
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async () => {
+      fetchCount++;
+      return new Response('Authentication required', { status: 401, statusText: 'Unauthorized' });
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'test query');
+      assert.fail('Expected original 401 error');
+    } catch (error: any) {
+      assert.ok(error.message.includes('401') || error.message.includes('Server Error'));
+    }
+    assert.equal(fetchCount, 1);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('HTML fallback text output includes limited metadata note', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_HTML_FALLBACK', 'true');
+
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async () => {
+      fetchCount++;
+      if (fetchCount === 1) {
+        return new Response('JSON endpoint not found', { status: 404, statusText: 'Not Found' });
+      }
+
+      return new Response(searxngHtmlFixture);
+    });
+
+    const result = await performWebSearch(mockServer as any, 'html query');
+
+    assert.ok(result.includes('Note: Results parsed from SearXNG HTML fallback; metadata is limited.'));
+    assert.ok(result.includes('Title: Alpha Result'));
+    assert.ok(!result.includes('Relevance Score:'));
 
     fetchMocker.restore();
     envManager.restore();
@@ -319,14 +779,286 @@ async function runTests() {
     fetchMocker.mock(mockFetch);
 
     const result = await performWebSearch(mockServer as any, 'test query');
+    const lines = result.split('\n');
     assert.ok(typeof result === 'string');
     assert.ok(result.includes('Test Result 1'));
     assert.ok(result.includes('Test Result 2'));
-    assert.ok(result.includes('URL: https://example.com/1'));
-    assert.ok(result.includes('URL: https://example.com/2'));
+    assert.ok(lines.some((line) => line === 'URL: https://example.com/1'));
+    assert.ok(lines.some((line) => line === 'URL: https://example.com/2'));
 
     fetchMocker.restore();
     envManager.restore();
+  }, results);
+
+  await testFunction('formatCachedSearchResult annotates text and JSON, and never throws on bad JSON', () => {
+    // Text: appends the marker.
+    assert.equal(formatCachedSearchResult('plain body', 'text'), 'plain body\n\n_Cached result_');
+
+    // Valid JSON: stays parseable and gains cached: true.
+    const annotated = JSON.parse(formatCachedSearchResult('{"results":[]}', 'json'));
+    assert.deepEqual(annotated.results, []);
+    assert.equal(annotated.cached, true);
+
+    // Malformed JSON under a JSON key must not throw — serve it unannotated so a
+    // cache hit can never turn a previously successful call into a failure.
+    assert.equal(formatCachedSearchResult('not json{', 'json'), 'not json{');
+  }, results);
+
+  await testFunction('Second identical search returns cached result without calling fetch', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://cache.example.com');
+
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async (url, options) => {
+      fetchCount++;
+      return createMockFetch({
+        json: {
+          results: [
+            { title: 'Cached Result', content: 'Cached content', url: 'https://example.com/cached', score: 1 },
+          ],
+        },
+      })(url, options);
+    });
+
+    const firstResult = await performWebSearch(mockServer as any, 'cache query');
+    const secondResult = await performWebSearch(mockServer as any, 'cache query');
+
+    assert.equal(fetchCount, 1);
+    assert.ok(firstResult.includes('Cached Result'));
+    assert.ok(secondResult.includes('Cached Result'));
+    assert.ok(secondResult.endsWith('\n\n_Cached result_'), secondResult);
+
+    fetchMocker.restore();
+    envManager.restore();
+    searchCache.clear();
+  }, results);
+
+  await testFunction('Zero-result text searches are fetched again instead of cached', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://empty-cache-text.example.com');
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async (url, options) => {
+      fetchCount++;
+      return createMockFetch({ json: { results: [] } })(url, options);
+    });
+
+    try {
+      const first = await performWebSearch(mockServer as any, 'empty text cache');
+      const second = await performWebSearch(mockServer as any, 'empty text cache');
+
+      assert.equal(fetchCount, 2);
+      assert.ok(first.includes('No results found'));
+      assert.ok(second.includes('No results found'));
+      assert.ok(!second.includes('_Cached result_'), second);
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+    }
+  }, results);
+
+  await testFunction('Zero-result JSON searches are fetched again instead of cached', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://empty-cache-json.example.com');
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async (url, options) => {
+      fetchCount++;
+      return createMockFetch({ json: { query: 'empty json cache', results: [] } })(url, options);
+    });
+
+    try {
+      const first = JSON.parse(await performWebSearch(
+        mockServer as any,
+        'empty json cache',
+        1,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        'json',
+      ));
+      const second = JSON.parse(await performWebSearch(
+        mockServer as any,
+        'empty json cache',
+        1,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        'json',
+      ));
+
+      assert.equal(fetchCount, 2);
+      assert.deepEqual(first.results, []);
+      assert.deepEqual(second.results, []);
+      assert.equal(second.cached, undefined);
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+    }
+  }, results);
+
+  await testFunction('Cached text search includes _Cached result_ suffix', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://cache-marker.example.com');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({
+      json: {
+        results: [
+          { title: 'Marker Result', content: 'Marker content', url: 'https://example.com/marker', score: 0.9 },
+        ],
+      },
+    }));
+
+    const firstResult = await performWebSearch(mockServer as any, 'marker query');
+    const secondResult = await performWebSearch(mockServer as any, 'marker query');
+    const thirdResult = await performWebSearch(mockServer as any, 'marker query');
+
+    const markerCount = (text: string) => text.split('_Cached result_').length - 1;
+    assert.ok(!firstResult.includes('_Cached result_'), firstResult);
+    assert.equal(markerCount(secondResult), 1);
+    assert.equal(markerCount(thirdResult), 1);
+
+    fetchMocker.restore();
+    envManager.restore();
+    searchCache.clear();
+  }, results);
+
+  await testFunction('Cached JSON search remains parseable and includes cached field', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://cache-json.example.com');
+
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async (url, options) => {
+      fetchCount++;
+      return createMockFetch({
+        json: {
+          query: 'json cache',
+          results: [
+            { title: 'JSON Result', content: 'JSON content', url: 'https://example.com/json', score: 0.8 },
+          ],
+        },
+      })(url, options);
+    });
+
+    const firstPayload = JSON.parse(await performWebSearch(mockServer as any, 'json cache', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json'));
+    const secondResult = await performWebSearch(mockServer as any, 'json cache', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const secondPayload = JSON.parse(secondResult);
+
+    assert.equal(fetchCount, 1);
+    assert.equal(firstPayload.cached, undefined);
+    assert.equal(secondPayload.cached, true);
+    assert.ok(!secondResult.includes('_Cached result_'), secondResult);
+
+    fetchMocker.restore();
+    envManager.restore();
+    searchCache.clear();
+  }, results);
+
+  await testFunction('Expired cached search hits fetch again', async () => withControlledClock((advance) => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://cache-expiry.example.com');
+
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async (url, options) => {
+      fetchCount++;
+      return createMockFetch({
+        json: {
+          results: [
+            {
+              title: `Fresh Result ${fetchCount}`,
+              content: 'Fresh content',
+              url: `https://example.com/fresh-${fetchCount}`,
+              score: 1,
+            },
+          ],
+        },
+      })(url, options);
+    });
+
+    return (async () => {
+      searchCache.set('searxng_web_search', {
+        query: 'unused warmup',
+      }, 'unused');
+
+      await performWebSearch(mockServer as any, 'expiry query');
+      advance(86400001);
+      const result = await performWebSearch(mockServer as any, 'expiry query');
+
+      assert.equal(fetchCount, 2);
+      assert.ok(result.includes('Fresh Result 2'), result);
+      assert.ok(!result.includes('_Cached result_'), result);
+
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+    })();
+  }), results);
+
+  await testFunction('Different effective args do not share cached results', async () => {
+    searchCache.clear();
+    clearInstanceInfoCacheForTests();
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://cache-a.example.com;https://cache-b.example.com');
+    envManager.set('SEARXNG_FANOUT', 'false');
+    envManager.set('SEARXNG_DEFAULT_LANGUAGE', 'en');
+    envManager.set('SEARXNG_DEFAULT_SAFESEARCH', '1');
+    envManager.set('SEARXNG_MAX_RESULT_CHARS', '30');
+
+    const mockServer = createMockServer();
+    let searchFetchCount = 0;
+    fetchMocker.mock(async (url, options) => {
+      const parsedUrl = new URL(url.toString());
+      if (parsedUrl.pathname.endsWith('/config')) {
+        return createMockFetch({ json: makeConfigWithEngines() })(url, options);
+      }
+
+      searchFetchCount++;
+      return createMockFetch({
+        json: {
+          query: parsedUrl.searchParams.get('q'),
+          results: [
+            {
+              title: `Variant ${searchFetchCount}`,
+              content: `Variant content ${searchFetchCount}`,
+              url: `https://example.com/variant-${searchFetchCount}`,
+              score: 1,
+            },
+          ],
+        },
+      })(url, options);
+    });
+
+    await performWebSearch(mockServer as any, 'variant query', 1, undefined, undefined, undefined, undefined, 1, 'News', undefined, 'text');
+    await performWebSearch(mockServer as any, 'variant query', 1, undefined, undefined, undefined, undefined, 2, 'News', undefined, 'text');
+    await performWebSearch(mockServer as any, 'variant query', 1, undefined, undefined, undefined, undefined, 2, 'News', undefined, 'json');
+    await performWebSearch(mockServer as any, 'variant query', 1, undefined, 'fr', undefined, undefined, 2, 'News', undefined, 'json');
+    await performWebSearch(mockServer as any, 'variant query', 1, undefined, 'fr', 2, undefined, 2, 'News', 'Google', 'json');
+    envManager.set('SEARXNG_FANOUT', 'true');
+    await performWebSearch(mockServer as any, 'variant query', 1, undefined, 'fr', 2, undefined, 2, 'News', 'Google', 'json');
+    envManager.set('SEARXNG_URL', 'https://cache-c.example.com;https://cache-d.example.com');
+    await performWebSearch(mockServer as any, 'variant query', 1, undefined, 'fr', 2, undefined, 2, 'News', 'Google', 'json');
+
+    assert.equal(searchFetchCount, 9);
+
+    fetchMocker.restore();
+    envManager.restore();
+    searchCache.clear();
+    clearInstanceInfoCacheForTests();
+    clearSearxngInstanceStateForTests();
   }, results);
 
   await testFunction('min_score filters out lower relevance results', async () => {
@@ -458,6 +1190,22 @@ async function runTests() {
     envManager.restore();
   }, results);
 
+  await testFunction('SEARXNG_MAX_RESULTS rejects a numeric prefix with a suffix', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_MAX_RESULTS', '5s');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({ json: { results: makeMockSearchResults(6) } }));
+
+    try {
+      const result = await performWebSearch(mockServer as any, 'suffix max results');
+      assert.ok(result.includes('Result 6'));
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+    }
+  }, results);
+
   await testFunction('Omitted num_results and unset SEARXNG_MAX_RESULTS preserves all results', async () => {
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
     envManager.delete('SEARXNG_MAX_RESULTS');
@@ -492,9 +1240,10 @@ async function runTests() {
     fetchMocker.mock(mockFetch);
 
     const result = await performWebSearch(mockServer as any, 'test query');
+    const lines = result.split('\n');
     assert.ok(result.includes('Title: Long title should stay intact'));
     assert.ok(result.includes('Description: abcdefghij…'));
-    assert.ok(result.includes('URL: https://example.com/long-url-that-stays-intact'));
+    assert.ok(lines.some((line) => line === 'URL: https://example.com/long-url-that-stays-intact'));
     assert.ok(!result.includes('Description: abcdefghijklmnopqrstuvwxyz'));
 
     fetchMocker.restore();
@@ -554,8 +1303,95 @@ async function runTests() {
     envManager.restore();
   }, results);
 
+  await testFunction('SEARXNG_MAX_RESULT_CHARS rejects a numeric prefix with a suffix', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_MAX_RESULT_CHARS', '5x');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({
+      json: {
+        results: [{
+          title: 'Untruncated suffix result',
+          content: 'abcdefghijklmnopqrstuvwxyz',
+          url: 'https://example.com/untruncated-suffix',
+          score: 1,
+        }],
+      },
+    }));
+
+    try {
+      const result = await performWebSearch(mockServer as any, 'suffix max chars');
+      assert.ok(result.includes('Description: abcdefghijklmnopqrstuvwxyz'));
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+    }
+  }, results);
+
+  // A NaN/non-positive timeout makes setTimeout(abort, ms) fire on the next tick,
+  // aborting every search. These assert the parser guards it. Tested directly
+  // because the mock fetch resolves on a microtask and ignores the abort signal,
+  // so an end-to-end search can't distinguish the bug from the fix (BUG-013).
+  await testFunction('getSearchTimeoutMs falls back to default for non-numeric value', () => {
+    envManager.set('SEARXNG_TIMEOUT_MS', 'abc');
+    const mockServer = createMockServer();
+    assert.equal(getSearchTimeoutMs(mockServer as any), 10000);
+    envManager.restore();
+  }, results);
+
+  await testFunction('getSearchTimeoutMs falls back to default for non-positive value', () => {
+    envManager.set('SEARXNG_TIMEOUT_MS', '-5');
+    const mockServer = createMockServer();
+    assert.equal(getSearchTimeoutMs(mockServer as any), 10000);
+    envManager.restore();
+  }, results);
+
+  await testFunction('getSearchTimeoutMs falls back to default for a unit-suffixed value', () => {
+    // parseInt("10s") would be 10 (a 10ms timeout) — Number() rejects it.
+    envManager.set('SEARXNG_TIMEOUT_MS', '10s');
+    const mockServer = createMockServer();
+    assert.equal(getSearchTimeoutMs(mockServer as any), 10000);
+    envManager.restore();
+  }, results);
+
+  await testFunction('getSearchTimeoutMs falls back to default for a decimal value', () => {
+    envManager.set('SEARXNG_TIMEOUT_MS', '1.5');
+    const mockServer = createMockServer();
+    assert.equal(getSearchTimeoutMs(mockServer as any), 10000);
+    envManager.restore();
+  }, results);
+
+  await testFunction('getSearchTimeoutMs falls back to default above the setTimeout ceiling', () => {
+    // > 2^31-1 ms: Node clamps setTimeout to 1 ms, so treat it as invalid.
+    envManager.set('SEARXNG_TIMEOUT_MS', '99999999999');
+    const mockServer = createMockServer();
+    assert.equal(getSearchTimeoutMs(mockServer as any), 10000);
+    envManager.restore();
+  }, results);
+
+  await testFunction('getSearchTimeoutMs honors a valid value', () => {
+    envManager.set('SEARXNG_TIMEOUT_MS', '5000');
+    const mockServer = createMockServer();
+    assert.equal(getSearchTimeoutMs(mockServer as any), 5000);
+    envManager.restore();
+  }, results);
+
+  await testFunction('getSearchTimeoutMs warns on invalid value', () => {
+    envManager.set('SEARXNG_TIMEOUT_MS', 'abc');
+    const { server, getLoggingCalls } = createMockServerWithTracking();
+    getSearchTimeoutMs(server as any);
+    const warning = getLoggingCalls().find(
+      (call) => call.level === 'warning'
+        && typeof call.data?.message === 'string'
+        && call.data.message.includes('Ignoring invalid SEARXNG_TIMEOUT_MS="abc"'),
+    );
+    assert.ok(warning, 'Expected a warning for invalid SEARXNG_TIMEOUT_MS');
+    envManager.restore();
+  }, results);
+
   await testFunction('User-Agent header added when USER_AGENT env var is set', async () => {
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.delete('SEARCH_USER_AGENT');
     envManager.set('USER_AGENT', 'MyCustomBot/1.0');
 
     const mockServer = createMockServer();
@@ -574,14 +1410,44 @@ async function runTests() {
 
     const options = getCapturedOptions();
     const headers = options?.headers as Record<string, string>;
-    assert.ok(headers?.['User-Agent'] === 'MyCustomBot/1.0', `Expected User-Agent header, got: ${JSON.stringify(headers)}`);
+    assert.ok(headers?.['user-agent'] === 'MyCustomBot/1.0', `Expected User-Agent header, got: ${JSON.stringify(headers)}`);
 
     fetchMocker.restore();
     envManager.restore();
   }, results);
 
+  await testFunction('SEARCH_USER_AGENT overrides USER_AGENT for search requests', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARCH_USER_AGENT', 'SearchBot/2.0');
+    envManager.set('USER_AGENT', 'GlobalBot/1.0');
+
+    const mockServer = createMockServer();
+    const { mockFetch, getCapturedOptions } = createCapturingMockFetch();
+
+    fetchMocker.mock(async (url, options) => {
+      await mockFetch(url, options);
+      throw new Error('MOCK_STOP');
+    });
+
+    try {
+      try {
+        await performWebSearch(mockServer as any, 'test query');
+      } catch {
+        // expected
+      }
+
+      const options = getCapturedOptions();
+      const headers = options?.headers as Record<string, string>;
+      assert.equal(headers?.['user-agent'], 'SearchBot/2.0');
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+    }
+  }, results);
+
   await testFunction('User-Agent header absent when USER_AGENT env var not set', async () => {
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.delete('SEARCH_USER_AGENT');
     envManager.delete('USER_AGENT');
 
     const mockServer = createMockServer();
@@ -600,7 +1466,7 @@ async function runTests() {
 
     const options = getCapturedOptions();
     const headers = (options?.headers || {}) as Record<string, string>;
-    assert.ok(!headers['User-Agent'], `Expected no User-Agent header`);
+    assert.ok(!headers['user-agent'], `Expected no User-Agent header`);
 
     fetchMocker.restore();
     envManager.restore();
@@ -610,12 +1476,11 @@ async function runTests() {
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
 
     const mockServer = createMockServer();
-    fetchMocker.mock(async () => ({
-      ok: false,
+    fetchMocker.mock(async () => createStreamResponse([], {
       status: 500,
       statusText: 'Internal Server Error',
-      text: async () => { throw new Error('text() failed'); }
-    } as any));
+      errorAfterChunks: true,
+    }));
 
     try {
       await performWebSearch(mockServer as any, 'test query');
@@ -632,13 +1497,7 @@ async function runTests() {
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
 
     const mockServer = createMockServer();
-    fetchMocker.mock(async () => ({
-      ok: true,
-      status: 200,
-      statusText: 'OK',
-      json: async () => { throw new Error('JSON parse failed'); },
-      text: async () => { throw new Error('text() also failed'); }
-    } as any));
+    fetchMocker.mock(async () => createStreamResponse([], { errorAfterChunks: true }));
 
     try {
       await performWebSearch(mockServer as any, 'test query');
@@ -703,6 +1562,28 @@ async function runTests() {
           error.message.includes('timeout')
         ));
       assert.ok(isAbortOrNetwork, `Unexpected error: ${error.name}: ${error.message}`);
+    }
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('read-only error message (aborted request) does not throw a secondary TypeError', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://user:pass@abort.example.com');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(async () => {
+      throw new DOMException('This operation was aborted', 'AbortError');
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'abort');
+      assert.fail('Expected a handled network error');
+    } catch (error: any) {
+      assert.ok(!/only a getter|set property message/.test(error.message), error.message);
+      assert.match(error.message, /^🌐 Network Error:/);
+      assert.ok(!error.message.includes('user:pass@'), error.message);
     }
 
     fetchMocker.restore();
@@ -851,8 +1732,114 @@ async function runTests() {
 
     assert.equal(requestedUrls.length, 2, 'Expected /config validation before search');
     const searchUrl = requestedUrls[1];
-    assert.ok(searchUrl.includes('engines=google%2Cddg'), `Expected encoded engines param in ${searchUrl}`);
     assert.equal(new URL(searchUrl).searchParams.get('engines'), 'google,ddg');
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('explicit engine with unsupported time_range is rejected before search', async () => {
+    clearInstanceInfoCacheForTests();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+
+    const mockServer = createMockServer();
+    const requestedUrls: string[] = [];
+    fetchMocker.mock(async (url) => {
+      requestedUrls.push(url.toString());
+      return createMockFetch({ json: makeConfigWithEngines() })(url);
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'AI', 1, 'year', undefined, undefined, undefined, undefined, undefined, 'github');
+      assert.fail('Expected incompatible time_range to be rejected');
+    } catch (error: any) {
+      assert.ok(error.message.includes('github'), error.message);
+      assert.ok(error.message.includes('time_range=year'), error.message);
+      assert.ok(error.message.includes('misleading empty result'), error.message);
+    }
+
+    assert.equal(requestedUrls.length, 1);
+    assert.ok(new URL(requestedUrls[0]).pathname.endsWith('/config'));
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('explicit engine with supported time_range reaches search unchanged', async () => {
+    clearInstanceInfoCacheForTests();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+
+    const mockServer = createMockServer();
+    const requestedUrls: string[] = [];
+    fetchMocker.mock(async (url) => {
+      requestedUrls.push(url.toString());
+      const parsedUrl = new URL(url.toString());
+      return createMockFetch({
+        json: parsedUrl.pathname.endsWith('/config') ? makeConfigWithEngines() : { results: [] },
+      })(url);
+    });
+
+    await performWebSearch(mockServer as any, 'AI', 1, 'year', undefined, undefined, undefined, undefined, undefined, 'google');
+
+    assert.equal(requestedUrls.length, 2);
+    const searchUrl = new URL(requestedUrls[1]);
+    assert.equal(searchUrl.searchParams.get('engines'), 'google');
+    assert.equal(searchUrl.searchParams.get('time_range'), 'year');
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('unavailable /config rejects explicit engine plus time_range without searching', async () => {
+    clearInstanceInfoCacheForTests();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+
+    const mockServer = createMockServer();
+    const requestedUrls: string[] = [];
+    fetchMocker.mock(async (url) => {
+      requestedUrls.push(url.toString());
+      return createMockFetch({ ok: false, status: 403, statusText: 'Forbidden' })(url);
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'AI', 1, 'year', undefined, undefined, undefined, undefined, undefined, 'github');
+      assert.fail('Expected unavailable capability discovery to stop the search');
+    } catch (error: any) {
+      assert.ok(error.message.includes('/config is unavailable'), error.message);
+      assert.ok(error.message.includes('omit time_range') || error.message.includes('Omit time_range'), error.message);
+    }
+
+    assert.equal(requestedUrls.length, 1);
+    assert.ok(new URL(requestedUrls[0]).pathname.endsWith('/config'));
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('partial multi-instance /config failure rejects time_range before search', async () => {
+    clearInstanceInfoCacheForTests();
+    envManager.set('SEARXNG_URL', 'https://up.example.com;https://down.example.com');
+
+    const mockServer = createMockServer();
+    const requestedUrls: string[] = [];
+    fetchMocker.mock(async (url, options) => {
+      requestedUrls.push(url.toString());
+      if (new URL(url.toString()).origin === 'https://down.example.com') {
+        throw new Error('temporary outage');
+      }
+      return createMockFetch({ json: makeConfigWithEngines() })(url, options);
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'AI', 1, 'year', undefined, undefined, undefined, undefined, undefined, 'google');
+      assert.fail('Expected partial capability discovery failure to reject the search');
+    } catch (error: any) {
+      assert.ok(error.message.includes('google'), error.message);
+      assert.ok(error.message.includes('time_range=year'), error.message);
+    }
+
+    assert.equal(requestedUrls.length, 2);
+    assert.ok(requestedUrls.every((requestedUrl) => new URL(requestedUrl).pathname.endsWith('/config')));
 
     fetchMocker.restore();
     envManager.restore();
@@ -895,96 +1882,88 @@ async function runTests() {
     envManager.restore();
   }, results);
 
-  await testFunction('invalid engine names from live /config throw helpful validation error', async () => {
+  await testFunction('unknown engine names from live /config pass through in caller order', async () => {
     clearInstanceInfoCacheForTests();
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
 
     const mockServer = createMockServer();
-    let searchCalled = false;
+    const requestedUrls: string[] = [];
 
     fetchMocker.mock(async (url) => {
+      requestedUrls.push(url.toString());
       const parsedUrl = new URL(url.toString());
       if (parsedUrl.pathname.endsWith('/config')) {
         return createMockFetch({ json: makeConfigWithEngines() })(url);
       }
-      searchCalled = true;
       return createMockFetch({ json: { results: [] } })(url);
     });
 
-    try {
-      await performWebSearch(mockServer as any, 'test query', 1, undefined, undefined, undefined, undefined, undefined, undefined, 'google,missing,bad');
-      assert.fail('Expected invalid engine validation error');
-    } catch (error: any) {
-      assert.ok(error.message.includes('Invalid SearXNG engine name(s): missing, bad'), error.message);
-      assert.ok(error.message.includes('searxng_instance_info'), error.message);
-    }
-    assert.equal(searchCalled, false, 'Search should not run after validation failure');
+    await performWebSearch(mockServer as any, 'test query', 1, undefined, undefined, undefined, undefined, undefined, undefined, 'Google, missing , Semantic Scholar, bad');
+
+    assert.equal(requestedUrls.length, 2, 'Expected /config validation before search');
+    const searchUrl = new URL(requestedUrls[1]);
+    assert.equal(searchUrl.searchParams.get('engines'), 'google,missing,semantic scholar,bad');
 
     fetchMocker.restore();
     envManager.restore();
   }, results);
 
-  await testFunction('unknown category from live /config throws validation error with available categories', async () => {
+  await testFunction('unknown category from live /config passes through in caller order', async () => {
     clearInstanceInfoCacheForTests();
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
 
     const mockServer = createMockServer();
-    let searchCalled = false;
+    const requestedUrls: string[] = [];
 
     fetchMocker.mock(async (url) => {
+      requestedUrls.push(url.toString());
       const parsedUrl = new URL(url.toString());
       if (parsedUrl.pathname.endsWith('/config')) {
         return createMockFetch({ json: makeConfigWithEngines() })(url);
       }
-      searchCalled = true;
       return createMockFetch({ json: { results: [] } })(url);
     });
 
-    try {
-      await performWebSearch(mockServer as any, 'test query', 1, undefined, undefined, undefined, undefined, undefined, 'unknown');
-      assert.fail('Expected invalid category validation error');
-    } catch (error: any) {
-      assert.ok(error.message.includes('Invalid SearXNG category name(s): unknown'), error.message);
-      assert.ok(error.message.includes('Available categories: general, news, social media'), error.message);
-      assert.ok(error.message.includes('searxng_instance_info'), error.message);
-    }
-    assert.equal(searchCalled, false, 'Search should not run after validation failure');
+    await performWebSearch(mockServer as any, 'test query', 1, undefined, undefined, undefined, undefined, undefined, 'News, unknown , Social Media');
+
+    assert.equal(requestedUrls.length, 2, 'Expected /config validation before search');
+    const searchUrl = new URL(requestedUrls[1]);
+    assert.equal(searchUrl.searchParams.get('categories'), 'news,unknown,social media');
 
     fetchMocker.restore();
     envManager.restore();
   }, results);
 
-  await testFunction('unknown engine from live /config throws validation error with available engines', async () => {
+  await testFunction('available-only engine from aggregate /config is accepted and normalized', async () => {
     clearInstanceInfoCacheForTests();
-    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_URL', 'https://one.example.com;https://two.example.com');
 
     const mockServer = createMockServer();
-    let searchCalled = false;
+    const requestedUrls: string[] = [];
 
     fetchMocker.mock(async (url) => {
+      requestedUrls.push(url.toString());
       const parsedUrl = new URL(url.toString());
       if (parsedUrl.pathname.endsWith('/config')) {
-        return createMockFetch({ json: makeConfigWithEngines() })(url);
+        const config = makeConfigWithEngines();
+        if (parsedUrl.origin === 'https://two.example.com') {
+          config.engines.push({ name: 'qwant', disabled: false });
+        }
+        return createMockFetch({ json: config })(url);
       }
-      searchCalled = true;
       return createMockFetch({ json: { results: [] } })(url);
     });
 
-    try {
-      await performWebSearch(mockServer as any, 'test query', 1, undefined, undefined, undefined, undefined, undefined, undefined, 'missing');
-      assert.fail('Expected invalid engine validation error');
-    } catch (error: any) {
-      assert.ok(error.message.includes('Invalid SearXNG engine name(s): missing'), error.message);
-      assert.ok(error.message.includes('Available engines:'), error.message);
-      assert.ok(error.message.includes('semantic scholar'), error.message);
-    }
-    assert.equal(searchCalled, false, 'Search should not run after validation failure');
+    await performWebSearch(mockServer as any, 'test query', 1, undefined, undefined, undefined, undefined, undefined, undefined, 'Qwant', 'json');
+
+    const searchUrl = new URL(requestedUrls.find((requestedUrl) => new URL(requestedUrl).pathname.endsWith('/search'))!);
+    assert.equal(searchUrl.searchParams.get('engines'), 'qwant');
 
     fetchMocker.restore();
     envManager.restore();
   }, results);
 
-  await testFunction('stale config refreshes once and then normalizes newly available value', async () => {
+  await testFunction('unknown value with cached config is forwarded without refresh retry', async () => {
     clearInstanceInfoCacheForTests();
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
 
@@ -998,10 +1977,6 @@ async function runTests() {
       if (parsedUrl.pathname.endsWith('/config')) {
         configFetchCount++;
         const config = makeConfigWithEngines();
-        if (configFetchCount === 2) {
-          config.categories.push('software wikis');
-          config.engines.push({ name: 'annas archive', disabled: false });
-        }
         return createMockFetch({ json: config })(url);
       }
       return createMockFetch({ json: { results: [] } })(url);
@@ -1020,12 +1995,12 @@ async function runTests() {
       'Annas Archive',
     );
 
-    assert.equal(configFetchCount, 2, 'Expected cached config plus one refresh');
+    assert.equal(configFetchCount, 1, 'Expected cached config without invalid-value refresh retry');
     const configRequests = requestedUrls.filter((url) => new URL(url).pathname.endsWith('/config'));
-    assert.equal(configRequests.length, 2, 'Expected exactly one refresh request');
-    const searchUrl = new URL(requestedUrls[2]);
-    assert.equal(searchUrl.searchParams.get('categories'), 'software wikis');
-    assert.equal(searchUrl.searchParams.get('engines'), 'annas archive');
+    assert.equal(configRequests.length, 1, 'Expected exactly one config request');
+    const searchUrl = new URL(requestedUrls[1]);
+    assert.equal(searchUrl.searchParams.get('categories'), 'Software Wikis');
+    assert.equal(searchUrl.searchParams.get('engines'), 'Annas Archive');
 
     fetchMocker.restore();
     envManager.restore();
@@ -1309,6 +2284,33 @@ async function runTests() {
     envManager.restore();
   }, results);
 
+  await testFunction('SEARXNG_DEFAULT_SAFESEARCH rejects a numeric prefix with a suffix', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_DEFAULT_SAFESEARCH', '1x');
+
+    const mockServer = createMockServer();
+    const { mockFetch, getCapturedUrl } = createCapturingMockFetch();
+
+    fetchMocker.mock(async (url, options) => {
+      await mockFetch(url, options);
+      throw new Error('MOCK_STOP');
+    });
+
+    try {
+      try {
+        await performWebSearch(mockServer as any, 'suffix safe search');
+      } catch {
+        // expected
+      }
+
+      const url = new URL(getCapturedUrl());
+      assert.equal(url.searchParams.get('safesearch'), null);
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+    }
+  }, results);
+
   await testFunction('text output prepends answers before result list', async () => {
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
 
@@ -1362,6 +2364,80 @@ async function runTests() {
     envManager.restore();
   }, results);
 
+  await testFunction('a malformed infobox url entry is skipped instead of throwing a TypeError', async () => {
+    // A null entry used to throw a raw TypeError out of performWebSearch, and
+    // non-string fields rendered as "[object Object]: not a url".
+    const result = await searchWithMetadata('malformed infobox urls', {
+      infoboxes: [
+        {
+          infobox: 'Ada Lovelace',
+          urls: [
+            null,
+            42,
+            { title: { nested: true }, url: ['not a url'] },
+            { title: 'Biography', url: 'https://example.com/ada' },
+          ],
+        },
+      ],
+    });
+
+    assert.ok(result.split('\n').some((line) => line === 'Biography: https://example.com/ada'), result);
+    assert.ok(!result.includes('[object Object]'), result);
+    assert.ok(result.includes(METADATA_RESULT_ROW.title), result);
+  }, results);
+
+  await testFunction('a malformed infobox is skipped without dropping its well-formed neighbours', async () => {
+    const result = await searchWithMetadata('malformed infobox', {
+      infoboxes: [null, 'brave', { infobox: 'Ada Lovelace', content: 'English mathematician' }],
+    });
+
+    assert.ok(result.includes('Infobox: Ada Lovelace'), result);
+    assert.ok(result.includes('English mathematician'), result);
+    assert.ok(!result.includes('[object Object]'), result);
+  }, results);
+
+  await testFunction('non-string answers, corrections and suggestions are dropped, not rendered as objects', async () => {
+    const result = await searchWithMetadata('non-string metadata', {
+      answers: [{ answer: '42' }, null, '  ', 'The answer is 42'],
+      corrections: [{ correction: 'ada' }, 'ada lovelace'],
+      suggestions: [null, 'ada lovelace biography'],
+    });
+
+    assert.ok(!result.includes('[object Object]'), result);
+    assert.equal(result.split('Direct answer:').length - 1, 1, result);
+    assert.ok(result.includes('Direct answer: The answer is 42'), result);
+    assert.ok(result.includes('Spelling correction: did you mean "ada lovelace"?'), result);
+    assert.ok(result.includes('Suggestions: ada lovelace biography'), result);
+  }, results);
+
+  await testFunction('metadata cannot forge result lines with embedded newlines', async () => {
+    // Result fields already collapse newlines so a hostile instance cannot forge
+    // extra entries; metadata sections are rendered into the same text and so
+    // must too.
+    const result = await searchWithMetadata('newline injection', {
+      answers: ['ok\nTitle: Injected\nURL: https://evil.example.com'],
+      infoboxes: [{ infobox: 'Ada', content: 'bio\nURL: https://evil.example.com' }],
+    });
+
+    assert.ok(!result.split('\n').some((line) => line.startsWith('Title: Injected')), result);
+    assert.ok(!result.split('\n').some((line) => line === 'URL: https://evil.example.com'), result);
+    assert.ok(result.includes('Direct answer: ok Title: Injected URL: https://evil.example.com'), result);
+    assert.ok(result.includes('bio URL: https://evil.example.com'), result);
+  }, results);
+
+  await testFunction('an entirely unusable metadata array adds no empty section', async () => {
+    const result = await searchWithMetadata('blank metadata sections', {
+      answers: ['', '   '],
+      // A fully blank infobox renders no bare "Infobox:" label either.
+      infoboxes: [null, 42, { infobox: '', content: '  ', urls: [null, { title: '', url: '' }] }],
+    });
+
+    assert.ok(!result.includes('Direct answer:'), result);
+    assert.ok(!result.includes('Infobox:'), result);
+    assert.ok(result.startsWith(`Title: ${METADATA_RESULT_ROW.title}`), result);
+  }, results);
+
+
   await testFunction('text output prepends infoboxes but omits unresponsive engines', async () => {
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
 
@@ -1390,7 +2466,7 @@ async function runTests() {
     const result = await performWebSearch(mockServer as any, 'Ada Lovelace');
     assert.ok(result.includes('Infobox: Ada Lovelace'), result);
     assert.ok(result.includes('English mathematician and writer'), result);
-    assert.ok(result.includes('Biography: https://example.com/ada'), result);
+    assert.ok(result.split('\n').some((line) => line === 'Biography: https://example.com/ada'), result);
     assert.ok(!result.includes('Unresponsive engines:'), result);
 
     fetchMocker.restore();
@@ -1452,6 +2528,171 @@ async function runTests() {
     envManager.restore();
   }, results);
 
+  await testFunction('omitted response_format honors SEARXNG_DEFAULT_RESPONSE_FORMAT=json', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', '  json  ');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({
+      json: {
+        query: 'environment json query',
+        number_of_results: 1,
+        results: [
+          {
+            title: 'Environment JSON Result',
+            content: 'Structured result content',
+            url: 'https://example.com/environment-json',
+            score: 1,
+          },
+        ],
+      },
+    }));
+
+    try {
+      const result = await performWebSearch(mockServer as any, 'environment json query');
+      const payload = JSON.parse(result);
+      assert.equal(payload.query, 'environment json query');
+      assert.equal(payload.results[0].title, 'Environment JSON Result');
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+    }
+  }, results);
+
+  await testFunction('unset, blank, and text response defaults stay formatted and silent', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.delete('SEARXNG_DEFAULT_RESPONSE_FORMAT');
+    const { server, getLoggingCalls } = createMockServerWithTracking();
+    fetchMocker.mock(createMockFetch({
+      json: {
+        query: 'text default',
+        number_of_results: 1,
+        results: [{ title: 'Text Default', content: 'Body', url: 'https://example.com/text-default', score: 1 }],
+      },
+    }));
+
+    try {
+      const unset = await performWebSearch(server as any, 'unset default');
+      envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', '   ');
+      const blank = await performWebSearch(server as any, 'blank default');
+      envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', ' text ');
+      const configuredText = await performWebSearch(server as any, 'text default');
+
+      for (const output of [unset, blank, configuredText]) {
+        assert.ok(output.includes('Title: Text Default'), output);
+        assert.throws(() => JSON.parse(output));
+      }
+      assert.equal(getLoggingCalls().filter((call) => call.level === 'warning').length, 0);
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+    }
+  }, results);
+
+  await testFunction('invalid configured format warns once per server without echoing the value', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    const invalidValue = 'sensitive-invalid-sentinel-7f3a';
+    envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', invalidValue);
+    const first = createMockServerWithTracking();
+    const second = createMockServerWithTracking();
+    fetchMocker.mock(createMockFetch({
+      json: {
+        query: 'invalid default',
+        number_of_results: 1,
+        results: [{ title: 'Fallback Text', content: 'Body', url: 'https://example.com/fallback', score: 1 }],
+      },
+    }));
+
+    try {
+      const firstCall = await performWebSearch(first.server as any, 'invalid default one');
+      const repeatedCall = await performWebSearch(first.server as any, 'invalid default two');
+      envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', 'JSON');
+      const secondServerCall = await performWebSearch(second.server as any, 'invalid default three');
+
+      for (const output of [firstCall, repeatedCall, secondServerCall]) {
+        assert.ok(output.includes('Title: Fallback Text'), output);
+      }
+      const firstWarning = getSingleResponseFormatWarning(first.getLoggingCalls());
+      const secondWarning = getSingleResponseFormatWarning(second.getLoggingCalls());
+      assert.ok(!firstWarning.toLowerCase().includes(invalidValue.toLowerCase()), firstWarning);
+      assert.ok(!secondWarning.includes('JSON'), secondWarning);
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+    }
+  }, results);
+
+  await testFunction('explicit response_format overrides the environment without resolving an invalid default', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', 'invalid-explicit-override');
+    const { server, getLoggingCalls } = createMockServerWithTracking();
+    fetchMocker.mock(createMockFetch({
+      json: {
+        query: 'explicit override',
+        number_of_results: 1,
+        results: [{ title: 'Explicit Result', content: 'Body', url: 'https://example.com/explicit', score: 1 }],
+      },
+    }));
+
+    try {
+      const text = await performWebSearch(server as any, 'explicit text', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text');
+      const json = await performWebSearch(server as any, 'explicit json', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+
+      assert.ok(text.includes('Title: Explicit Result'), text);
+      assert.equal(JSON.parse(json).results[0].title, 'Explicit Result');
+      assert.equal(getLoggingCalls().filter((call) => call.level === 'warning').length, 0);
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+    }
+  }, results);
+
+  await testFunction('effective response format isolates cache entries and annotations', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', 'text');
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async (url, options) => {
+      fetchCount++;
+      return createMockFetch({
+        json: {
+          query: 'format cache',
+          number_of_results: 1,
+          results: [{ title: 'Format Cache', content: 'Body', url: 'https://example.com/cache-format', score: 1 }],
+        },
+      })(url, options);
+    });
+
+    try {
+      const firstText = await performWebSearch(mockServer as any, 'format cache');
+      envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', 'json');
+      const firstJson = await performWebSearch(mockServer as any, 'format cache');
+      envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', 'text');
+      const cachedText = await performWebSearch(mockServer as any, 'format cache');
+      envManager.set('SEARXNG_DEFAULT_RESPONSE_FORMAT', 'json');
+      const cachedJson = await performWebSearch(mockServer as any, 'format cache');
+
+      assert.equal(fetchCount, 2);
+      assert.ok(!firstText.endsWith('_Cached result_'), firstText);
+      assert.equal(JSON.parse(firstJson).cached, undefined);
+      assert.ok(cachedText.endsWith('\n\n_Cached result_'), cachedText);
+      assert.equal(JSON.parse(cachedJson).cached, true);
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+    }
+  }, results);
+
   await testFunction('response_format=json returns parseable SearXNG JSON with raw metadata', async () => {
     envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
 
@@ -1482,6 +2723,210 @@ async function runTests() {
 
     fetchMocker.restore();
     envManager.restore();
+  }, results);
+
+  await testFunction('compact result detail returns exact text and JSON shapes without metadata', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({ json: {
+      query: 'compact query', answers: ['42'], suggestions: ['ignored'], corrections: ['corrected'], infoboxes: [{ infobox: 'ignored' }], results: [
+        { title: 'First', content: 'First snippet', url: 'https://example.com/first', score: 0.9876, engines: ['google'], category: 'news', publishedDate: 'today' },
+        { title: 2, content: null, url: false },
+      ],
+    } }));
+    try {
+      const text = await performWebSearch(mockServer as any, 'compact query', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'compact');
+      assert.equal(text, 'Title: First\nDescription: First snippet\nURL: https://example.com/first\n\nTitle: \nDescription: \nURL: ');
+      assert.ok(!text.endsWith('\n'), text);
+      assert.equal((text.match(/\n\n/g) ?? []).length, 1, text);
+      for (const excluded of ['Direct answer:', 'Suggestions:', 'Corrections:', 'Infobox:', 'Relevance Score:', 'Engines:', 'Category:']) {
+        assert.ok(!text.includes(excluded), text);
+      }
+      const json = await performWebSearch(mockServer as any, 'compact json', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'compact');
+      assert.deepEqual(JSON.parse(json), { results: [
+        { title: 'First', url: 'https://example.com/first', content: 'First snippet' },
+        { title: '', url: '', content: '' },
+      ] });
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
+  }, results);
+
+  await testFunction('compact text normalizes upstream line separators without changing compact JSON strings', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_MAX_RESULT_CHARS', '8');
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({ json: { results: [{
+      title: 'Title\r\nwith\u2028separators', content: 'Description\nwith\r\u2029separators', url: 'https://example.com/one\ntwo',
+    }] } }));
+    try {
+      const text = await performWebSearch(mockServer as any, 'line separators', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'compact');
+      assert.equal(text, 'Title: Title with separators\nDescription: Descript\u2026\nURL: https://example.com/one two');
+      assert.equal((text.match(/\n/g) ?? []).length, 2, text);
+      assert.ok(!text.endsWith('\n'), text);
+      const json = JSON.parse(await performWebSearch(mockServer as any, 'line separators json', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'compact'));
+      assert.equal(json.results[0].title, 'Title\r\nwith\u2028separators');
+      assert.equal(json.results[0].content, 'Descript\u2026');
+      assert.equal(json.results[0].url, 'https://example.com/one\ntwo');
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
+  }, results);
+
+  await testFunction('compact suppresses validation warnings and multi-instance provenance in text and JSON', async () => {
+    clearInstanceInfoCacheForTests();
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    const mockServer = createMockServer();
+    fetchMocker.mock(async (url) => {
+      const parsedUrl = new URL(url.toString());
+      if (parsedUrl.pathname.endsWith('/config')) throw new Error('config blocked');
+      return createMockFetch({ json: { results: [{ title: 'Compact', content: 'Body', url: 'https://example.com/compact' }] } })(url);
+    });
+    try {
+      const warningText = await performWebSearch(mockServer as any, 'compact warning text', 1, undefined, undefined, undefined, undefined, undefined, 'Unknown Category', undefined, 'text', 'compact');
+      assert.equal(warningText, 'Title: Compact\nDescription: Body\nURL: https://example.com/compact');
+      const warningJson = JSON.parse(await performWebSearch(mockServer as any, 'compact warning json', 1, undefined, undefined, undefined, undefined, undefined, 'Unknown Category', undefined, 'json', 'compact'));
+      assert.deepEqual(warningJson, { results: [{ title: 'Compact', url: 'https://example.com/compact', content: 'Body' }] });
+
+      fetchMocker.restore();
+      clearSearxngInstanceStateForTests();
+      envManager.set('SEARXNG_URL', 'https://first.example.com;https://second.example.com');
+      fetchMocker.mock(async (url) => {
+        if (new URL(url.toString()).hostname === 'first.example.com') throw new Error('first down');
+        return createMockFetch({ json: { results: [{ title: 'Second', content: 'Recovered', url: 'https://example.com/recovered' }] } })(url);
+      });
+      const provenanceText = await performWebSearch(mockServer as any, 'compact provenance text', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'compact');
+      assert.equal(provenanceText, 'Title: Second\nDescription: Recovered\nURL: https://example.com/recovered');
+      const provenanceJson = JSON.parse(await performWebSearch(mockServer as any, 'compact provenance json', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'compact'));
+      assert.deepEqual(provenanceJson, { results: [{ title: 'Second', url: 'https://example.com/recovered', content: 'Recovered' }] });
+    } finally {
+      fetchMocker.restore();
+      clearInstanceInfoCacheForTests();
+      clearSearxngInstanceStateForTests();
+      envManager.restore();
+      searchCache.clear();
+    }
+  }, results);
+
+  await testFunction('compact result detail uses the existing no-results diagnostic and cache hits are byte-identical', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({ json: { answers: ['42'], suggestions: ['ignored'], corrections: ['ignored'], infoboxes: [{ infobox: 'ignored' }], results: [] } }));
+    try {
+      const empty = await performWebSearch(mockServer as any, 'no compact results', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'compact');
+      assert.ok(empty.includes('No results found'), empty);
+      for (const excluded of ['Direct answer:', 'Suggestions:', 'Corrections:', 'Infobox:']) assert.ok(!empty.includes(excluded), empty);
+      const emptyJson = await performWebSearch(mockServer as any, 'no compact results json', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'compact');
+      assert.equal(emptyJson, '{\n  "results": []\n}');
+      fetchMocker.mock(createMockFetch({ json: { results: [{ title: 'Cached', content: 'Body', url: 'https://example.com/cached' }] } }));
+      const first = await performWebSearch(mockServer as any, 'cached compact', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'compact');
+      const cached = await performWebSearch(mockServer as any, 'cached compact', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'compact');
+      assert.equal(cached, first);
+      const firstJson = await performWebSearch(mockServer as any, 'cached compact json', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'compact');
+      const cachedJson = await performWebSearch(mockServer as any, 'cached compact json', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'compact');
+      assert.equal(cachedJson, firstJson);
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
+  }, results);
+
+  await testFunction('result detail truncates only content in all text and JSON combinations and isolates cache entries', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_MAX_RESULT_CHARS', '4');
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    const expectedUrl = 'https://example.com/long-url-stays-whole';
+    fetchMocker.mock(async (url, options) => {
+      fetchCount++;
+      return createMockFetch({ json: {
+        query: 'truncate', answers: ['kept in full'], results: [{
+          title: 'Long title stays whole', content: 'abcdefgh', url: expectedUrl,
+          score: 0.5, engines: ['google', 'bing'], category: 'news', publishedDate: '2026-08-07', thumbnail: 'thumb', img_src: 'image',
+        }],
+      } })(url, options);
+    });
+    try {
+      const compactText = await performWebSearch(mockServer as any, 'truncate', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'compact');
+      const fullText = await performWebSearch(mockServer as any, 'truncate', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'full');
+      const compactJson = JSON.parse(await performWebSearch(mockServer as any, 'truncate', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'compact'));
+      const fullJson = JSON.parse(await performWebSearch(mockServer as any, 'truncate', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'full'));
+      for (const output of [compactText, fullText, JSON.stringify(compactJson), JSON.stringify(fullJson)]) {
+        assert.ok(output.includes('abcd…'), output);
+        assert.ok(output.includes('Long title stays whole'), output);
+        assert.ok(!output.includes('abcde'), output);
+      }
+      assert.equal(compactText.split('\n').find((line) => line.startsWith('URL: ')), `URL: ${expectedUrl}`);
+      assert.equal(fullText.split('\n').find((line) => line.startsWith('URL: ')), `URL: ${expectedUrl}`);
+      assert.equal(compactJson.results[0].url, expectedUrl);
+      assert.equal(fullJson.results[0].url, expectedUrl);
+      assert.ok(fullText.includes('Relevance Score: 0.500'), fullText);
+      assert.ok(fullText.includes('Engines: google, bing'), fullText);
+      assert.ok(fullText.includes('Category: news'), fullText);
+      assert.ok(fullText.includes('Published Date: 2026-08-07'), fullText);
+      assert.ok(fullText.includes('Thumbnail: thumb'), fullText);
+      assert.ok(fullText.includes('Image Source: image'), fullText);
+      const metadataLines = ['Title:', 'Description:', 'URL:', 'Relevance Score:', 'Engines:', 'Category:', 'Published Date:', 'Thumbnail:', 'Image Source:'];
+      assert.deepEqual(metadataLines.map((prefix) => fullText.indexOf(prefix)), [...metadataLines.map((prefix) => fullText.indexOf(prefix))].sort((a, b) => a - b));
+      assert.deepEqual(compactJson, { results: [{ title: 'Long title stays whole', url: 'https://example.com/long-url-stays-whole', content: 'abcd…' }] });
+      assert.deepEqual(fullJson.answers, ['kept in full']);
+      assert.equal(fullJson.results[0].engines[0], 'google');
+      assert.equal(fetchCount, 4);
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
+  }, results);
+
+  await testFunction('full JSON preserves raw metadata, clones before truncation, and omits invalid optional text lines', async () => {
+    searchCache.clear();
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('SEARXNG_MAX_RESULT_CHARS', '4');
+    const source = {
+      query: 'clone', answers: ['raw answer'], suggestions: ['raw suggestion'],
+      results: [
+        { title: 'Raw', content: 'abcdefgh', url: 'https://example.com/raw', score: Number.NaN, engines: ['google', 3] as any, category: 3 as any, publishedDate: '' },
+        { title: 'Missing', url: 'https://example.com/missing' } as any,
+        { title: 'Non-string', content: 7, url: 'https://example.com/non-string' } as any,
+      ],
+    };
+    const mockServer = createMockServer();
+    fetchMocker.mock(async () => new Response(JSON.stringify(source)));
+    try {
+      const json = JSON.parse(await performWebSearch(mockServer as any, 'clone', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'full'));
+      assert.deepEqual(json.answers, ['raw answer']);
+      assert.deepEqual(json.suggestions, ['raw suggestion']);
+      assert.equal(json.results[0].content, 'abcd\u2026');
+      assert.equal('content' in json.results[1], false);
+      assert.equal(json.results[2].content, 7);
+      assert.equal(source.results[0].content, 'abcdefgh', 'response data must not be mutated during truncation');
+
+      envManager.delete('SEARXNG_MAX_RESULT_CHARS');
+      const uncapped = JSON.parse(await performWebSearch(mockServer as any, 'clone uncapped', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json', 'full'));
+      assert.equal(uncapped.results[0].content, 'abcdefgh');
+      assert.equal('content' in uncapped.results[1], false);
+      assert.equal(uncapped.results[2].content, 7);
+
+      const text = await performWebSearch(mockServer as any, 'clone text', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'full');
+      for (const omitted of ['Relevance Score:', 'Engines:', 'Category:', 'Published Date:', 'Thumbnail:', 'Image Source:']) assert.ok(!text.includes(omitted), text);
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
+  }, results);
+
+  await testFunction('full text normalizes line separators and omits empty engine metadata', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({ json: { results: [{
+      title: 'Full\rTitle', content: 'Body\nDescription', url: 'https://example.com/full\u2028fake', score: 1,
+      engines: ['', ' bing\nfake ', ''], category: 'news\r\nTitle: forged', publishedDate: 'today\u2029tomorrow',
+      thumbnail: 'thumb\nline', img_src: 'image\rline',
+    }] } }));
+    try {
+      const text = await performWebSearch(mockServer as any, 'full line normalization', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'text', 'full');
+      assert.equal(text, [
+        'Title: Full Title',
+        'Description: Body Description',
+        'URL: https://example.com/full fake',
+        'Relevance Score: 1.000',
+        'Engines: bing fake',
+        'Category: news Title: forged',
+        'Published Date: today tomorrow',
+        'Thumbnail: thumb line',
+        'Image Source: image line',
+      ].join('\n'));
+      assert.ok(!text.includes('\nTitle: forged'), text);
+    } finally { fetchMocker.restore(); envManager.restore(); searchCache.clear(); }
   }, results);
 
   await testFunction('response_format=text returns formatted text output', async () => {
@@ -1547,12 +2992,722 @@ async function runTests() {
     const result = await performWebSearch(mockServer as any, 'empty query', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
     const payload = JSON.parse(result);
     assert.equal(payload.query, 'empty query');
+    assert.equal(payload.number_of_results, 0);
     assert.deepEqual(payload.results, []);
     assert.deepEqual(payload.suggestions, ['broader query']);
     assert.ok(!result.includes('No results found'), result);
 
     fetchMocker.restore();
     envManager.restore();
+  }, results);
+
+  await testFunction('single-instance JSON response has no servedBy provenance', async () => {
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.delete('SEARXNG_FANOUT');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({
+      json: {
+        query: 'single query',
+        results: [
+          { title: 'Single Result', content: 'Only instance', url: 'https://example.com/single', score: 1 },
+        ],
+      },
+    }));
+
+    const result = await performWebSearch(mockServer as any, 'single query', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const payload = JSON.parse(result);
+    assert.equal(payload.servedBy, undefined);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('multi-instance failover tries second after first hard failure and reports servedBy', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://first.example.com;https://second.example.com');
+    envManager.delete('SEARXNG_FANOUT');
+
+    const mockServer = createMockServer();
+    const requestedHosts: string[] = [];
+    fetchMocker.mock(async (url) => {
+      const parsedUrl = new URL(url.toString());
+      requestedHosts.push(parsedUrl.origin);
+      if (parsedUrl.hostname === 'first.example.com') {
+        throw new Error('first down');
+      }
+      return createMockFetch({
+        json: {
+          query: 'failover query',
+          results: [
+            { title: 'Second Result', content: 'Recovered', url: 'https://example.com/recovered', score: 0.9 },
+          ],
+        },
+      })(url);
+    });
+
+    const result = await performWebSearch(mockServer as any, 'failover query', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const payload = JSON.parse(result);
+
+    assert.deepEqual(requestedHosts, ['https://first.example.com', 'https://second.example.com']);
+    assert.deepEqual(payload.servedBy, ['https://second.example.com']);
+    assert.equal(payload.results[0].title, 'Second Result');
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('multi-instance search uses embedded auth first and global fallback second', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://embedded:p%40ss@first.example.com;https://second.example.com');
+    envManager.set('AUTH_USERNAME', 'global-user');
+    envManager.set('AUTH_PASSWORD', 'global-pass');
+    envManager.delete('SEARXNG_FANOUT');
+
+    const mockServer = createMockServer();
+    const requests: Array<{ url: string; authorization?: string }> = [];
+
+    fetchMocker.mock(async (url, options) => {
+      const headers = (options?.headers || {}) as Record<string, string>;
+      requests.push({
+        url: url.toString(),
+        authorization: headers['authorization'],
+      });
+
+      const parsedUrl = new URL(url.toString());
+      if (parsedUrl.hostname === 'first.example.com') {
+        throw new Error('first instance unavailable');
+      }
+
+      return createMockFetch({
+        json: {
+          query: 'multi auth',
+          results: [
+            { title: 'Second Result', content: 'Second', url: 'https://example.com/second', score: 1 },
+          ],
+        },
+      })(url, options);
+    });
+
+    const result = await performWebSearch(mockServer as any, 'multi auth', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const payload = JSON.parse(result);
+
+    assert.equal(payload.results[0].title, 'Second Result');
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].authorization, `Basic ${Buffer.from('embedded:p@ss').toString('base64')}`);
+    assert.equal(requests[1].authorization, `Basic ${Buffer.from('global-user:global-pass').toString('base64')}`);
+    assert.ok(!requests[0].url.includes('embedded:p%40ss@'), requests[0].url);
+    assert.equal(new URL(requests[0].url).username, '');
+    assert.equal(new URL(requests[1].url).username, '');
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('multi-instance servedBy provenance redacts configured URL credentials in JSON output', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://user:pass@first.example.com;https://user:pass@second.example.com');
+    envManager.delete('SEARXNG_FANOUT');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(async (url) => {
+      const parsedUrl = new URL(url.toString());
+      if (parsedUrl.hostname === 'first.example.com') {
+        throw new Error('first down');
+      }
+      return createMockFetch({
+        json: {
+          query: 'redacted servedBy',
+          results: [
+            { title: 'Second Result', content: 'Recovered', url: 'https://example.com/recovered', score: 0.9 },
+          ],
+        },
+      })(url);
+    });
+
+    const result = await performWebSearch(mockServer as any, 'redacted servedBy', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const payload = JSON.parse(result);
+
+    assert.deepEqual(payload.servedBy, ['https://second.example.com/']);
+    assert.ok(!result.includes('user:pass@'), result);
+    assert.ok(!result.includes('user'), result);
+    assert.ok(!result.includes('pass'), result);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('multi-instance servedBy provenance redacts configured URL credentials in text output', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://user:pass@empty-one.example.com;https://user:pass@empty-two.example.com');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({ json: { query: 'empty text', results: [] } }));
+
+    const result = await performWebSearch(mockServer as any, 'empty text');
+
+    assert.equal(
+      result.split('\n')[0],
+      'Served by SearXNG instances: https://empty-one.example.com/, https://empty-two.example.com/',
+    );
+    assert.ok(!result.includes('user:pass@'), result);
+    assert.ok(!result.includes('user'), result);
+    assert.ok(!result.includes('pass'), result);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('empty multi-instance response is healthy and fails over without cooldown', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://empty.example.com;https://second.example.com');
+
+    const mockServer = createMockServer();
+    const requestedHosts: string[] = [];
+    fetchMocker.mock(async (url) => {
+      const parsedUrl = new URL(url.toString());
+      requestedHosts.push(parsedUrl.origin);
+      if (parsedUrl.hostname === 'empty.example.com') {
+        return createMockFetch({ json: { query: 'empty first', results: [] } })(url);
+      }
+      return createMockFetch({
+        json: {
+          query: 'empty first',
+          results: [
+            { title: 'Second Result', content: 'Has result', url: 'https://example.com/second', score: 0.8 },
+          ],
+        },
+      })(url);
+    });
+
+    const firstResult = await performWebSearch(mockServer as any, 'empty first', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const secondResult = await performWebSearch(mockServer as any, 'empty first again', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+
+    assert.deepEqual(requestedHosts, [
+      'https://empty.example.com',
+      'https://second.example.com',
+      'https://empty.example.com',
+      'https://second.example.com',
+    ]);
+    assert.deepEqual(JSON.parse(firstResult).servedBy, ['https://second.example.com']);
+    assert.deepEqual(JSON.parse(secondResult).servedBy, ['https://second.example.com']);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('all multi-instance responses empty returns existing JSON empty response with provenance', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://empty-one.example.com;https://empty-two.example.com');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({ json: { query: 'empty query', number_of_results: 0, results: [] } }));
+
+    const result = await performWebSearch(mockServer as any, 'empty query', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const payload = JSON.parse(result);
+
+    assert.deepEqual(payload.results, []);
+    assert.deepEqual(payload.servedBy, ['https://empty-one.example.com', 'https://empty-two.example.com']);
+    assert.ok(!result.includes('No results found'));
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('all multi-instance responses empty returns existing text no-results message with provenance', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://empty-one.example.com;https://empty-two.example.com');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(createMockFetch({ json: { query: 'empty text', results: [] } }));
+
+    const result = await performWebSearch(mockServer as any, 'empty text');
+
+    assert.equal(
+      result.split('\n')[0],
+      'Served by SearXNG instances: https://empty-one.example.com, https://empty-two.example.com',
+    );
+    assert.ok(result.includes('No results found for "empty text"'), result);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('all multi-instance hard failures throw aggregate error with underlying reason', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://first.example.com;https://second.example.com');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(async (url) => {
+      const parsedUrl = new URL(url.toString());
+      throw new Error(`${parsedUrl.hostname} failed`);
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'all fail');
+      assert.fail('Expected aggregate multi-instance failure');
+    } catch (error: any) {
+      assert.ok(error.message.includes('All configured SearXNG instances failed'), error.message);
+      assert.match(error.message, /first\.example\.com failed/);
+      assert.match(error.message, /second\.example\.com failed/);
+    }
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('all multi-instance hard failures redact credential-bearing configured URLs in aggregate error', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://user:pass@first.example.com;https://user:pass@second.example.com');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(async (url) => {
+      throw new Error(`${url.toString()} failed`);
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'all fail redacted');
+      assert.fail('Expected aggregate multi-instance failure');
+    } catch (error: any) {
+      assert.ok(error.message.includes('All configured SearXNG instances failed'), error.message);
+      assert.match(error.message, /^All configured SearXNG instances failed\. https:\/\/first\.example\.com\/: /);
+      assert.match(error.message, /^All configured SearXNG instances failed\..*https:\/\/second\.example\.com\/: /);
+      assert.ok(!error.message.includes('user:pass@'), error.message);
+      assert.ok(!error.message.includes('user'), error.message);
+      assert.ok(!error.message.includes('pass'), error.message);
+    }
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('credential-free aggregate hard-failure text is unchanged exactly', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://first.example.com;https://second.example.com');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(async (url) => {
+      const parsedUrl = new URL(url.toString());
+      throw new Error(`${parsedUrl.hostname} failed`);
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'all fail exact');
+      assert.fail('Expected aggregate multi-instance failure');
+    } catch (error: any) {
+      assert.equal(
+        error.message,
+        'All configured SearXNG instances failed. https://first.example.com: 🌐 Network Error: first.example.com failed; https://second.example.com: 🌐 Network Error: second.example.com failed',
+      );
+    }
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('single-instance ECONNREFUSED error redacts credential-bearing configured URL', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://user:pass@only.example.com');
+
+    const mockServer = createMockServer();
+    const refused = new Error('connect ECONNREFUSED');
+    (refused as any).code = 'ECONNREFUSED';
+    fetchMocker.mock(async () => {
+      throw refused;
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'refused');
+      assert.fail('Expected ECONNREFUSED error');
+    } catch (error: any) {
+      assert.match(error.message, /^🌐 Connection Error: SearXNG server is not responding \(https:\/\/only\.example\.com\//);
+      assert.ok(!error.message.includes('user:pass@'), error.message);
+      assert.ok(!error.message.includes('user'), error.message);
+      assert.ok(!error.message.includes('pass'), error.message);
+    }
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('search request log redacts credential-bearing configured URL', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://user:pass@log.example.com');
+
+    const { server, getLoggingCalls } = createMockServerWithTracking();
+    fetchMocker.mock(createMockFetch({
+      json: {
+        query: 'log redaction',
+        results: [
+          { title: 'Logged Result', content: 'Logged', url: 'https://example.com/logged', score: 1 },
+        ],
+      },
+    }));
+
+    await performWebSearch(server as any, 'log redaction');
+
+    const requestLog = getLoggingCalls()
+      .map((call) => call.data?.message)
+      .find((message) => typeof message === 'string' && message.includes('Making request to:'));
+    assert.ok(requestLog, 'Expected Making request to log');
+    assert.match(requestLog, /^Making request to: https:\/\/log\.example\.com\//);
+    assert.ok(!requestLog.includes('user:pass@'), requestLog);
+    assert.ok(!requestLog.includes('user'), requestLog);
+    assert.ok(!requestLog.includes('pass'), requestLog);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('network failure diagnostics never include the search query', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://network-log.example.com');
+    const sentinelQuery = 'query-marker-5d9d2c';
+    const { server, getLoggingCalls } = createMockServerWithTracking();
+    fetchMocker.mock(async () => {
+      throw new Error('simulated network failure');
+    });
+
+    try {
+      await assert.rejects(() => performWebSearch(server as any, sentinelQuery));
+      const errorLogs = getLoggingCalls().filter((call) => call.level === 'error');
+      assert.ok(errorLogs.length > 0, 'Expected an error-level network diagnostic');
+      for (const errorLog of errorLogs) {
+        assert.ok(
+          !JSON.stringify(errorLog.data).includes(sentinelQuery),
+          `Query leaked into error diagnostic: ${JSON.stringify(errorLog.data)}`,
+        );
+      }
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      clearSearxngInstanceStateForTests();
+    }
+  }, results);
+
+  await testFunction('cooled down instance is skipped during failover', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://cooled.example.com;https://healthy.example.com');
+
+    recordSearxngInstanceFailure('https://cooled.example.com', Date.now());
+    recordSearxngInstanceFailure('https://cooled.example.com', Date.now());
+    recordSearxngInstanceFailure('https://cooled.example.com', Date.now());
+
+    const mockServer = createMockServer();
+    const requestedHosts: string[] = [];
+    fetchMocker.mock(async (url) => {
+      const parsedUrl = new URL(url.toString());
+      requestedHosts.push(parsedUrl.origin);
+      return createMockFetch({
+        json: {
+          query: 'skip cooled',
+          results: [
+            { title: 'Healthy Result', content: 'Healthy', url: 'https://example.com/healthy', score: 1 },
+          ],
+        },
+      })(url);
+    });
+
+    const result = await performWebSearch(mockServer as any, 'skip cooled');
+
+    assert.deepEqual(requestedHosts, ['https://healthy.example.com']);
+    assert.ok(result.includes('Healthy Result'));
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('fanout dedupes canonical URLs, keeps highest score, and orders descending', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://one.example.com;https://two.example.com');
+    envManager.set('SEARXNG_FANOUT', 'true');
+
+    const mockServer = createMockServer();
+    const requestedHosts: string[] = [];
+    fetchMocker.mock(async (url) => {
+      const parsedUrl = new URL(url.toString());
+      requestedHosts.push(parsedUrl.origin);
+      if (parsedUrl.hostname === 'one.example.com') {
+        return createMockFetch({
+          json: {
+            query: 'fanout',
+            number_of_results: 2,
+            results: [
+              { title: 'Lower Duplicate', content: 'Low', url: 'https://Example.com/same#section', score: 0.2 },
+              { title: 'Missing Score', content: 'No score', url: 'not a url', score: undefined },
+            ],
+          },
+        })(url);
+      }
+      return createMockFetch({
+        json: {
+          query: 'fanout',
+          number_of_results: 3,
+          results: [
+            { title: 'Highest', content: 'High', url: 'https://example.com/high', score: 0.95 },
+            { title: 'Higher Duplicate', content: 'Better', url: 'https://example.com/same', score: 0.7 },
+            { title: 'Raw URL Copy', content: 'Raw tie', url: 'not a url', score: 0.5 },
+          ],
+        },
+      })(url);
+    });
+
+    const result = await performWebSearch(mockServer as any, 'fanout', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const payload = JSON.parse(result);
+
+    assert.deepEqual(requestedHosts.sort(), ['https://one.example.com', 'https://two.example.com']);
+    assert.deepEqual(payload.servedBy, ['https://one.example.com', 'https://two.example.com']);
+    assert.deepEqual(payload.results.map((entry: any) => entry.title), ['Highest', 'Higher Duplicate', 'Raw URL Copy']);
+    assert.equal(payload.number_of_results, payload.results.length);
+    assert.equal(payload.number_of_results, 3);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('all cooled down instances throw cooldown-specific message without double spaces', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://cooled-one.example.com;https://cooled-two.example.com');
+
+    for (const instanceUrl of ['https://cooled-one.example.com', 'https://cooled-two.example.com']) {
+      recordSearxngInstanceFailure(instanceUrl, Date.now());
+      recordSearxngInstanceFailure(instanceUrl, Date.now());
+      recordSearxngInstanceFailure(instanceUrl, Date.now());
+    }
+
+    const mockServer = createMockServer();
+    let fetchCalled = false;
+    fetchMocker.mock(async () => {
+      fetchCalled = true;
+      return createMockFetch({ json: { results: [] } })('https://unused.example.com');
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'all cooled');
+      assert.fail('Expected all-cooled error');
+    } catch (error: any) {
+      // Exact-match (not URL substring .includes()) so the assertion also covers
+      // ordering and the absence of double spaces, and avoids CodeQL's
+      // incomplete-url-substring-sanitization false positive on test code.
+      assert.equal(
+        error.message,
+        'All configured SearXNG instances are in cooldown after repeated failures: https://cooled-one.example.com, https://cooled-two.example.com.',
+      );
+      assert.ok(!error.message.includes('  '), error.message);
+    }
+    assert.equal(fetchCalled, false);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('all cooled down credential-bearing instances redact credentials and do not fetch', async () => {
+    clearSearxngInstanceStateForTests();
+    const configuredUrls = [
+      'https://user:pass@cooled-one.example.com',
+      'https://user:pass@cooled-two.example.com',
+    ];
+    envManager.set('SEARXNG_URL', configuredUrls.join(';'));
+
+    for (const instanceUrl of configuredUrls) {
+      recordSearxngInstanceFailure(instanceUrl, Date.now());
+      recordSearxngInstanceFailure(instanceUrl, Date.now());
+      recordSearxngInstanceFailure(instanceUrl, Date.now());
+    }
+
+    const mockServer = createMockServer();
+    let fetchCalled = false;
+    fetchMocker.mock(async () => {
+      fetchCalled = true;
+      return createMockFetch({ json: { results: [] } })('https://unused.example.com');
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'all cooled redacted');
+      assert.fail('Expected all-cooled error');
+    } catch (error: any) {
+      assert.equal(error.message, 'All configured SearXNG instances are in cooldown after repeated failures: https://cooled-one.example.com/, https://cooled-two.example.com/.');
+      assert.ok(!error.message.includes('user:pass@'), error.message);
+      assert.ok(!error.message.includes('user'), error.message);
+      assert.ok(!error.message.includes('pass'), error.message);
+    }
+    assert.equal(fetchCalled, false);
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('fanout returns partial successes and excludes failed instances from servedBy', async () => {
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://down.example.com;https://up.example.com');
+    envManager.set('SEARXNG_FANOUT', 'true');
+
+    const mockServer = createMockServer();
+    fetchMocker.mock(async (url) => {
+      const parsedUrl = new URL(url.toString());
+      if (parsedUrl.hostname === 'down.example.com') {
+        throw new Error('fanout down');
+      }
+      return createMockFetch({
+        json: {
+          query: 'partial fanout',
+          results: [
+            { title: 'Up Result', content: 'Up', url: 'https://example.com/up', score: 0.6 },
+          ],
+        },
+      })(url);
+    });
+
+    const result = await performWebSearch(mockServer as any, 'partial fanout', 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, 'json');
+    const payload = JSON.parse(result);
+
+    assert.deepEqual(payload.servedBy, ['https://up.example.com']);
+    assert.equal(payload.results[0].title, 'Up Result');
+
+    fetchMocker.restore();
+    envManager.restore();
+  }, results);
+
+  await testFunction('search accepts an exact response-body limit and rejects the next byte without caching or recording success', async () => {
+    searchCache.clear();
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://bounded.example.com');
+    const exactBody = JSON.stringify({
+      results: [{ title: 'Exact', content: 'bounded', url: 'https://example.com/exact', score: 1 }],
+    });
+    envManager.set('SEARXNG_MAX_RESPONSE_BYTES', String(Buffer.byteLength(exactBody)));
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async () => {
+      fetchCount++;
+      return createStreamResponse([utf8(fetchCount === 1 ? exactBody : `${exactBody} `)]);
+    });
+
+    try {
+      await performWebSearch(mockServer as any, 'exact body');
+      envManager.set('SEARXNG_URL', 'https://bounded.example.com;https://cooled.example.com');
+      recordSearxngInstanceFailure('https://bounded.example.com');
+      recordSearxngInstanceFailure('https://bounded.example.com');
+      recordSearxngInstanceFailure('https://cooled.example.com');
+      recordSearxngInstanceFailure('https://cooled.example.com');
+      recordSearxngInstanceFailure('https://cooled.example.com');
+      await assert.rejects(
+        () => performWebSearch(mockServer as any, 'next byte'),
+        /SearXNG response exceeds configured byte limit/,
+      );
+      assert.equal(isSearxngInstanceCooledDown('https://bounded.example.com'), true);
+
+      clearSearxngInstanceStateForTests();
+      envManager.set('SEARXNG_MAX_RESPONSE_BYTES', String(Buffer.byteLength(exactBody) + 1));
+      await performWebSearch(mockServer as any, 'next byte');
+      assert.equal(fetchCount, 3, 'an oversize response must not be stored in the search cache');
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+      clearSearxngInstanceStateForTests();
+    }
+  }, results);
+
+  await testFunction('HTML fallback accepts an exact response-body limit and rejects the next byte without caching or recording success', async () => {
+    searchCache.clear();
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://fallback-bounded.example.com');
+    envManager.set('SEARXNG_HTML_FALLBACK', 'true');
+    const exactBody = searxngHtmlFixture;
+    envManager.set('SEARXNG_MAX_RESPONSE_BYTES', String(Buffer.byteLength(exactBody)));
+    const mockServer = createMockServer();
+    let jsonFetchCount = 0;
+    let htmlFetchCount = 0;
+    fetchMocker.mock(async (url) => {
+      const requestUrl = new URL(url.toString());
+      if (requestUrl.searchParams.get('format') === 'json') {
+        jsonFetchCount++;
+        return new Response('JSON format is disabled', { status: 403, statusText: 'Forbidden' });
+      }
+
+      htmlFetchCount++;
+      return createStreamResponse([utf8(htmlFetchCount === 1 ? exactBody : `${exactBody} `)]);
+    });
+
+    try {
+      const exactResult = await performWebSearch(mockServer as any, 'fallback exact body');
+      assert.ok(exactResult.includes('Alpha Result'));
+
+      envManager.set('SEARXNG_URL', 'https://fallback-bounded.example.com;https://cooled.example.com');
+      recordSearxngInstanceFailure('https://fallback-bounded.example.com');
+      recordSearxngInstanceFailure('https://fallback-bounded.example.com');
+      recordSearxngInstanceFailure('https://cooled.example.com');
+      recordSearxngInstanceFailure('https://cooled.example.com');
+      recordSearxngInstanceFailure('https://cooled.example.com');
+      await assert.rejects(
+        () => performWebSearch(mockServer as any, 'fallback next byte'),
+        /SearXNG response exceeds configured byte limit/,
+      );
+      assert.equal(isSearxngInstanceCooledDown('https://fallback-bounded.example.com'), true);
+
+      clearSearxngInstanceStateForTests();
+      envManager.set('SEARXNG_MAX_RESPONSE_BYTES', String(Buffer.byteLength(exactBody) + 1));
+      await performWebSearch(mockServer as any, 'fallback next byte');
+      assert.equal(htmlFetchCount, 3, 'an oversize HTML fallback response must not be stored in the search cache');
+      assert.equal(jsonFetchCount, 3, 'each HTML fallback attempt must begin with the JSON request');
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+      clearSearxngInstanceStateForTests();
+    }
+  }, results);
+
+  await testFunction('search rejects partial and invalid bounded JSON before cache writes', async () => {
+    searchCache.clear();
+    clearSearxngInstanceStateForTests();
+    envManager.set('SEARXNG_URL', 'https://partial.example.com');
+    const mockServer = createMockServer();
+    let fetchCount = 0;
+    fetchMocker.mock(async () => {
+      fetchCount++;
+      if (fetchCount === 1) {
+        return createStreamResponse([utf8('{"results":')], { errorAfterChunks: true });
+      }
+      return createStreamResponse([utf8(JSON.stringify({ results: [] }))]);
+    });
+
+    try {
+      await assert.rejects(() => performWebSearch(mockServer as any, 'partial body'));
+      await performWebSearch(mockServer as any, 'partial body');
+      assert.equal(fetchCount, 2, 'a failed partial body must not create a cache entry');
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+      searchCache.clear();
+      clearSearxngInstanceStateForTests();
+    }
+  }, results);
+
+  await testFunction('HTTP error previews are bounded, redact URL credentials, and mark truncation', async () => {
+    envManager.set('SEARXNG_URL', 'https://user:pass@preview.example.com');
+    envManager.set('SEARXNG_MAX_RESPONSE_BYTES', '8');
+    const mockServer = createMockServer();
+    fetchMocker.mock(async () => createStreamResponse(
+      [utf8('https://user:pass@body.example.com/this-response-is-deliberately-long')],
+      { status: 400, statusText: 'Bad Request' },
+    ));
+
+    try {
+      await assert.rejects(
+        () => performWebSearch(mockServer as any, 'preview body'),
+        (error: Error) => {
+          assert.match(error.message, /400/);
+          assert.match(error.message, /\[Response body truncated\]/);
+          assert.ok(!error.message.includes('user:pass@'), error.message);
+          return true;
+        },
+      );
+    } finally {
+      fetchMocker.restore();
+      envManager.restore();
+    }
   }, results);
 
   printTestSummary(results, 'Search Module');

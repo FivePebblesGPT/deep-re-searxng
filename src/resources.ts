@@ -1,8 +1,71 @@
+import type { McpServer } from "@modelcontextprotocol/server";
 import { getCurrentLogLevel } from "./logging.js";
 import { packageVersion } from "./version.js";
 import { getHttpSecurityConfig } from "./http-security.js";
+import { parseSearxngUrls, redactSearxngInstanceUrl } from "./searxng-instances.js";
+import { PROXY_ENVIRONMENT_KEYS } from "./proxy-environment.js";
+import { assertSafeOutput } from "./credential-output.js";
 
-export function createConfigResource() {
+export const REQUIRED_CONFIGURATION_GUIDANCE =
+  "SEARXNG_URL is the only required environment variable.";
+export const OPTIONAL_CONFIGURATION_GUIDANCE =
+  "All other environment variables are optional; see CONFIGURATION.md for the complete reference.";
+
+export function createCliHelpText(): string {
+  return `Usage: mcp-searxng [options]
+
+Options:
+  --help, -h       Show this help and exit
+  --version, -v    Print the package version and exit
+
+Configuration:
+  ${REQUIRED_CONFIGURATION_GUIDANCE}
+  ${OPTIONAL_CONFIGURATION_GUIDANCE}
+
+Transport:
+  STDIO is the default transport.
+  MCP_HTTP_PORT enables HTTP transport.
+`.trimEnd();
+}
+
+// SEARXNG_URL may embed Basic Auth credentials in its userinfo (the recommended
+// auth path) and may be a semicolon-separated multi-instance list. Redact the
+// userinfo from each entry before exposing it in the config resource so the host
+// stays visible for debugging but embedded secrets are never returned to clients.
+function redactedConfiguredSearxngUrl(): string {
+  const raw = process.env.SEARXNG_URL;
+  if (!raw) {
+    return "(not configured)";
+  }
+  const redacted = raw
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "")
+    .map(redactSearxngInstanceUrl)
+    .join("; ");
+  return redacted || raw;
+}
+
+// Auth is configured when the global AUTH_* fallback is set or any instance URL
+// carries userinfo (the recommended per-instance path).
+function hasConfiguredAuth(): boolean {
+  if (process.env.AUTH_USERNAME && process.env.AUTH_PASSWORD) {
+    return true;
+  }
+  return parseSearxngUrls().some((instance) => {
+    try {
+      return new URL(instance).username !== "";
+    } catch {
+      return false;
+    }
+  });
+}
+
+function hasConfiguredProxy(): boolean {
+  return PROXY_ENVIRONMENT_KEYS.some((key) => Boolean(process.env[key]));
+}
+
+export function createConfigResource(mcpServer?: McpServer) {
   const security = getHttpSecurityConfig();
   const showFullConfig = !security.harden || security.exposeFullConfig;
 
@@ -14,13 +77,13 @@ export function createConfigResource() {
     },
     environment: {
       ...(showFullConfig
-        ? { searxngUrl: process.env.SEARXNG_URL || "(not configured)" }
+        ? { searxngUrl: redactedConfiguredSearxngUrl() }
         : { searxngUrlConfigured: !!process.env.SEARXNG_URL }),
-      hasAuth: !!(process.env.AUTH_USERNAME && process.env.AUTH_PASSWORD),
-      hasProxy: !!(process.env.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.https_proxy),
+      hasAuth: hasConfiguredAuth(),
+      hasProxy: hasConfiguredProxy(),
       hasNoProxy: !!(process.env.NO_PROXY || process.env.no_proxy),
       nodeVersion: process.version,
-      currentLogLevel: getCurrentLogLevel()
+      currentLogLevel: getCurrentLogLevel(mcpServer)
     },
     capabilities: {
       tools: [
@@ -35,7 +98,9 @@ export function createConfigResource() {
     }
   };
 
-  return JSON.stringify(config, null, 2);
+  const output = JSON.stringify(config, null, 2);
+  assertSafeOutput(output);
+  return output;
 }
 
 export function createHelpResource() {
@@ -47,7 +112,7 @@ This is a Model Context Protocol (MCP) server that provides web search, autocomp
 ## Available Tools
 
 ### 1. searxng_web_search
-Performs web searches using the configured SearXNG instance.
+Performs web searches using the configured SearXNG instance or replica list, with failover/fanout when multiple instances are configured.
 
 **Parameters:**
 - \`query\` (required): The search query string
@@ -57,11 +122,14 @@ Performs web searches using the configured SearXNG instance.
 - \`safesearch\` (optional): Safe search level - 0 (none), 1 (moderate), 2 (strict)
 - \`min_score\` (optional): Minimum relevance score from 0.0 to 1.0
 - \`num_results\` (optional): Maximum result count from 1 to 20
-- \`categories\` (optional): Comma-separated SearXNG categories such as "news" or "it,science"; live \`/config\` values are normalized case-insensitively when available
-- \`engines\` (optional): Comma-separated SearXNG engine names such as "google,bing,ddg" or "semantic scholar"; live \`/config\` values are normalized case-insensitively when available
-- \`response_format\` (optional): "text" for formatted output or "json" for raw SearXNG-shaped JSON (may include a \`warnings\` array for non-fatal issues)
+- \`categories\` (optional): Comma-separated SearXNG categories such as "news" or "it,science"; live \`/config\` values are aggregated across reachable instances and normalized case-insensitively when available
+- \`engines\` (optional): Comma-separated SearXNG engine names such as "google,bing,ddg" or "semantic scholar"; live \`/config\` values are aggregated across reachable instances and normalized case-insensitively when available
+- \`response_format\` (optional): Response format, either \`text\` or \`json\`. Text is formatted for agents; JSON preserves the SearXNG shape and may include a \`warnings\` array for non-fatal issues. If omitted, \`SEARXNG_DEFAULT_RESPONSE_FORMAT\` applies; if unset or invalid, text is used. An explicit \`response_format\` always takes precedence.
+- \`result_detail\` (optional): \`full\` (default) preserves SearXNG metadata, warnings, and research signals; \`compact\` returns only title, URL, and the description/content snippet per result (JSON keys: \`title\`, \`url\`, \`content\`). Use full when answers, infoboxes, corrections, suggestions, or provenance matter.
 
-Text output can include metadata sections for direct answers, spelling corrections, suggestions, and infoboxes before the result list. JSON output preserves the SearXNG response shape with filtered and sliced \`results\`, and may include a \`warnings\` array for non-fatal issues. Unknown categories or engines are rejected when live \`/config\` validation is available; if \`/config\` is unavailable, the search proceeds with the supplied values and emits a warning.
+With \`SEARXNG_LITE_TOOLS=true\`, the Lite schema stays query-only, but explicitly supplied optional overrides such as \`response_format\` and \`result_detail\` are still validated and honored. Compact suppresses configuration warnings and provenance while retaining engine-failure diagnostics. The full text optional lines appear only for valid values in fixed order: score, engines, category, published date, thumbnail, image source; text fields are normalized to single lines. \`SEARXNG_MAX_RESULT_CHARS\` applies only to result content in all four text/JSON and compact/full combinations, including full JSON. Compact text normalizes line separators before the cap, while JSON caps the original string value.
+
+Text output can include metadata sections for direct answers, spelling corrections, suggestions, and infoboxes before the result list. JSON output preserves the SearXNG response shape with filtered and sliced \`results\`, and may include a \`warnings\` array for non-fatal issues. Use \`searxng_instance_info\` and prefer \`common\` categories/engines for consistent multi-instance results; \`available\`-only filters are best-effort. Unknown categories or engines are forwarded trimmed so SearXNG can ignore or honor them; if \`/config\` is unavailable, the search normally proceeds with a warning. Explicit \`engines\` combined with \`time_range\` instead require verified time-range support on every configured instance and fail before search when that cannot be established.
 
 ### 2. searxng_search_suggestions
 Returns autocomplete suggestions from the configured SearXNG instance.
@@ -71,7 +139,7 @@ Returns autocomplete suggestions from the configured SearXNG instance.
 - \`language\` (optional): Language code like "en", "fr", "de" or "all" (default: "all")
 
 ### 3. searxng_instance_info
-Discovers categories, engines, defaults, locales, and plugins exposed by the configured SearXNG instance.
+Discovers categories, engines, defaults, locales, and plugins exposed by all reachable configured SearXNG instances. The response reports \`common\` values present on every reachable instance and \`available\` values present on at least one reachable instance.
 
 **Parameters:**
 - \`includeEngines\` (optional): Include enabled engine names
@@ -93,10 +161,14 @@ Reads and converts web page content to Markdown format.
 ## Configuration
 
 ### Required Environment Variables
-- \`SEARXNG_URL\`: URL of your SearXNG instance (e.g., http://localhost:8080)
+${REQUIRED_CONFIGURATION_GUIDANCE}
+- \`SEARXNG_URL\`: URL of your SearXNG instance (e.g., http://localhost:8080). For Basic Auth, embed credentials in the URL (e.g., https://user:password@search.example.com); percent-encode special characters in the username or password (e.g. \`@\` as \`%40\`). Multi-instance lists can use different credentials per semicolon-separated URL.
 
 ### Optional Environment Variables
-- \`AUTH_USERNAME\` & \`AUTH_PASSWORD\`: Basic authentication for SearXNG
+${OPTIONAL_CONFIGURATION_GUIDANCE}
+Common ones are listed below (failover/fan-out, caching, timeouts, result limits, per-tool proxies, TLS, HTTP transport, and hardening).
+- \`SEARXNG_DEFAULT_RESPONSE_FORMAT\`: Default omitted search responses to \`text\` or \`json\`; an explicit \`response_format\` takes precedence
+- \`AUTH_USERNAME\` & \`AUTH_PASSWORD\`: Legacy global Basic Auth fallback when \`SEARXNG_URL\` has no userinfo
 - \`HTTP_PROXY\` / \`HTTPS_PROXY\`: Proxy server configuration
 - \`NO_PROXY\` / \`no_proxy\`: Comma-separated list of hosts to bypass proxy
 - \`MCP_HTTP_PORT\`: Enable HTTP transport on specified port
@@ -111,7 +183,7 @@ Reads and converts web page content to Markdown format.
 Standard input/output transport for desktop clients like Claude Desktop.
 
 ### HTTP (Optional)
-RESTful HTTP transport for web applications. Set \`MCP_HTTP_PORT\` to enable.
+MCP Streamable HTTP transport for remote clients. Set \`MCP_HTTP_PORT\` to enable.
 
 ### Hardened HTTP Mode (Optional)
 Default behavior remains compatible for existing deployments.
@@ -151,9 +223,11 @@ Args: {"includeEngines": true}
 1. **"SEARXNG_URL not set"**: Configure the SEARXNG_URL environment variable
 2. **Network errors**: Check if SearXNG is running and accessible
 3. **Empty results**: Try different search terms or check SearXNG instance
-4. **Timeout errors**: The server has a 10-second timeout for URL fetching
+4. **Timeout errors**: The default per-attempt search and network-fetch budgets are 10 seconds. Replica attempts, HTML fallback, browser solvers and PDF parsing can add time; the client may also have its own timeout. See [timeout settings](https://github.com/ihor-sokoliuk/mcp-searxng/blob/main/CONFIGURATION.md#timeouts).
 
-Use logging level "debug" for detailed request information.
+Inspect the client's MCP events and process diagnostics. Per-call logs depend on client and protocol support; stderr or container logs may not include them all. There is no server LOG_LEVEL environment setting. Compact search output omits cache and fallback markers; use full output when investigating those signals.
+
+See the [tool reference](https://github.com/ihor-sokoliuk/mcp-searxng/blob/main/docs/tools.md) and [troubleshooting guide](https://github.com/ihor-sokoliuk/mcp-searxng/blob/main/docs/troubleshooting.md). These links open current documentation; use the matching Git tag for an older package.
 
 ## Current Configuration
 See the "Current Configuration" resource for live settings.

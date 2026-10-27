@@ -4,15 +4,15 @@
   "title": "Deep Re SearXNG",
   "description": "SearXNG MCP server bundled with Codex deep research skills",
   "repository": {
-    "url": "https://github.com/LocalT0aster/deep-re-searxng",
+    "url": "https://github.com/FivePebblesGPT/deep-re-searxng",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "2.9.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "deep-re-searxng",
-      "version": "0.1.0",
+      "version": "2.9.0",
       "transport": {
         "type": "stdio"
       },
@@ -21,7 +21,21 @@
           "name": "SEARXNG_URL",
           "description": "URL of your SearXNG instance",
           "isRequired": true,
-          "isSecret": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "AUTH_USERNAME",
+          "description": "Legacy global SearXNG Basic Auth username",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "AUTH_PASSWORD",
+          "description": "Legacy global SearXNG Basic Auth password",
+          "isRequired": false,
+          "isSecret": true,
           "format": "string"
         }
       ]

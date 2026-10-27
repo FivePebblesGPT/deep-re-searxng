@@ -16,25 +16,41 @@ jobs:
   test:
     name: Lint, Build, and Test
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22', '24', '26.7.0']
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '20'
+          node-version: ${{ matrix.node-version }}
           cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
+      - name: Install research validator dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt
+          printf '%s\n' "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
       - name: Lint
         run: npm run lint
+
+      - name: Registry publication regression tests (offline)
+        run: node --test scripts/publish-mcp-registry.test.mjs
 
       - name: Build
         run: npm run build
 
       - name: Test coverage
         run: npm run test:coverage
+
+      - name: E2E tests
+        run: npm run test:e2e

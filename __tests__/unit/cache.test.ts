@@ -13,6 +13,32 @@ import { testFunction, createTestResults, printTestSummary } from '../helpers/te
 
 const results = createTestResults();
 
+/**
+ * Run `fn` with a controllable clock: `Date.now()` returns a value the test
+ * moves forward via `advance(ms)`, and the real `Date.now` is ALWAYS restored
+ * afterward — even if `fn` (including cache construction) throws — so a failure
+ * can never leak a patched clock into later tests.
+ *
+ * This is the deterministic, instant replacement for real `setTimeout` sleeps
+ * when asserting TTL expiry. `SimpleCache` decides expiry via `Date.now()`
+ * (src/cache.ts), and `setTimeout` (timer clock) vs `Date.now()` (wall clock)
+ * are not guaranteed to advance in lockstep — notably on WSL2, where the wall
+ * clock drifts/resyncs — which is what made the sleep-based versions flaky
+ * (BUG-011).
+ */
+async function withControlledClock(
+  fn: (advance: (ms: number) => void) => void | Promise<void>,
+): Promise<void> {
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  try {
+    await fn((ms) => { now += ms; });
+  } finally {
+    Date.now = realNow;
+  }
+}
+
 async function runTests() {
   console.log('🧪 Testing: cache.ts\n');
 
@@ -20,10 +46,10 @@ async function runTests() {
     const testCache = new SimpleCache(1000); // 1 second TTL
 
     // Test set and get
-    testCache.set('test-url', '<html>test</html>', '# Test');
+    testCache.set('test-url', '# Test');
     const entry = testCache.get('test-url');
     assert.ok(entry);
-    assert.equal(entry.htmlContent, '<html>test</html>');
+    assert.equal(Object.hasOwn(entry, 'htmlContent'), false);
     assert.equal(entry.markdownContent, '# Test');
 
     testCache.destroy();
@@ -32,7 +58,7 @@ async function runTests() {
   await testFunction('Cache hitCount increments on repeated get() hits', () => {
     const testCache = new SimpleCache(1000);
 
-    testCache.set('popular-url', '<html>popular</html>', '# Popular');
+    testCache.set('popular-url', '# Popular');
 
     assert.equal(testCache.get('popular-url')?.hitCount, 1);
     assert.equal(testCache.get('popular-url')?.hitCount, 2);
@@ -49,45 +75,50 @@ async function runTests() {
     testCache.destroy();
   }, results);
 
-  await testFunction('Cache TTL expiration', async () => {
-    const testCache = new SimpleCache(50); // 50ms TTL
-
-    testCache.set('short-lived', '<html>test</html>', '# Test');
-
-    // Should exist immediately
-    assert.ok(testCache.get('short-lived'));
-
-    // Wait for expiration
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    // Should be expired
-    assert.equal(testCache.get('short-lived'), null);
-
-    testCache.destroy();
-  }, results);
-
-  await testFunction('Cache uses CACHE_TTL_MS when constructed without explicit TTL', async () => {
-    const previousTtl = process.env.CACHE_TTL_MS;
-    process.env.CACHE_TTL_MS = '1000';
-    const testCache = new SimpleCache();
-
+  await testFunction('Cache TTL expiration', () => withControlledClock((advance) => {
+    let testCache: SimpleCache | undefined;
     try {
-      testCache.set('env-ttl', '<html>test</html>', '# Test');
+      testCache = new SimpleCache(50); // 50ms TTL
+
+      testCache.set('short-lived', '# Test');
+
+      // Should exist immediately
+      assert.ok(testCache.get('short-lived'));
+
+      // Advance past the TTL
+      advance(51);
+
+      // Should be expired
+      assert.equal(testCache.get('short-lived'), null);
+    } finally {
+      testCache?.destroy();
+    }
+  }), results);
+
+  await testFunction('Cache uses CACHE_TTL_MS when constructed without explicit TTL', () => withControlledClock((advance) => {
+    const previousTtl = process.env.CACHE_TTL_MS;
+    let testCache: SimpleCache | undefined;
+    try {
+      process.env.CACHE_TTL_MS = '1000';
+      testCache = new SimpleCache();
+
+      testCache.set('env-ttl', '# Test');
 
       assert.ok(testCache.get('env-ttl'));
 
-      await new Promise(resolve => setTimeout(resolve, 1050));
+      // Advance past the env-configured 1000ms TTL
+      advance(1001);
 
       assert.equal(testCache.get('env-ttl'), null);
     } finally {
-      testCache.destroy();
+      testCache?.destroy();
       if (previousTtl === undefined) {
         delete process.env.CACHE_TTL_MS;
       } else {
         process.env.CACHE_TTL_MS = previousTtl;
       }
     }
-  }, results);
+  }), results);
 
   await testFunction('Cache falls back to defaults for invalid CACHE_TTL_MS and CACHE_MAX_ENTRIES', () => {
     const previousTtl = process.env.CACHE_TTL_MS;
@@ -115,11 +146,50 @@ async function runTests() {
     }
   }, results);
 
+  await testFunction('Cache rejects a numeric prefix with a suffix in CACHE_TTL_MS', () => {
+    const previousTtl = process.env.CACHE_TTL_MS;
+    process.env.CACHE_TTL_MS = '500x';
+    const testCache = new SimpleCache();
+
+    try {
+      assert.equal((testCache as any).ttlMs, 86400000);
+    } finally {
+      testCache.destroy();
+      if (previousTtl === undefined) {
+        delete process.env.CACHE_TTL_MS;
+      } else {
+        process.env.CACHE_TTL_MS = previousTtl;
+      }
+    }
+  }, results);
+
+  await testFunction('Cache rejects non-decimal and unsafe integer spellings in CACHE_TTL_MS', () => {
+    const previousTtl = process.env.CACHE_TTL_MS;
+
+    try {
+      for (const value of ['5.0', '1e3', '0x10', '9007199254740993']) {
+        process.env.CACHE_TTL_MS = value;
+        const testCache = new SimpleCache();
+        try {
+          assert.equal((testCache as any).ttlMs, 86400000, value);
+        } finally {
+          testCache.destroy();
+        }
+      }
+    } finally {
+      if (previousTtl === undefined) {
+        delete process.env.CACHE_TTL_MS;
+      } else {
+        process.env.CACHE_TTL_MS = previousTtl;
+      }
+    }
+  }, results);
+
   await testFunction('Cache clear functionality', () => {
     const testCache = new SimpleCache(1000);
 
-    testCache.set('url1', '<html>1</html>', '# 1');
-    testCache.set('url2', '<html>2</html>', '# 2');
+    testCache.set('url1', '# 1');
+    testCache.set('url2', '# 2');
 
     assert.ok(testCache.get('url1'));
     assert.ok(testCache.get('url2'));
@@ -135,8 +205,8 @@ async function runTests() {
   await testFunction('Cache statistics', () => {
     const testCache = new SimpleCache(1000);
 
-    testCache.set('url1', '<html>1</html>', '# 1');
-    testCache.set('url2', '<html>2</html>', '# 2');
+    testCache.set('url1', '# 1');
+    testCache.set('url2', '# 2');
 
     const stats = testCache.getStats();
     assert.equal(stats.size, 2);
@@ -152,14 +222,14 @@ async function runTests() {
   await testFunction('Cache evicts lowest hitCount entry when capacity is exceeded', () => {
     const testCache = new SimpleCache(1000, 2);
 
-    testCache.set('popular-url', '<html>popular</html>', '# Popular');
-    testCache.set('cold-url', '<html>cold</html>', '# Cold');
+    testCache.set('popular-url', '# Popular');
+    testCache.set('cold-url', '# Cold');
 
     for (let i = 0; i < 5; i++) {
       assert.ok(testCache.get('popular-url'));
     }
 
-    testCache.set('new-url', '<html>new</html>', '# New');
+    testCache.set('new-url', '# New');
 
     assert.ok(testCache.get('popular-url'), 'Expected popular URL to remain cached');
     assert.equal(testCache.get('cold-url'), null, 'Expected cold URL to be evicted');
@@ -169,26 +239,30 @@ async function runTests() {
     testCache.destroy();
   }, results);
 
-  await testFunction('Cache purges expired entries before LFU eviction', async () => {
-    const testCache = new SimpleCache(50, 2, 1000);
+  await testFunction('Cache purges expired entries before LFU eviction', () => withControlledClock((advance) => {
+    let testCache: SimpleCache | undefined;
+    try {
+      testCache = new SimpleCache(50, 2, 1000);
 
-    testCache.set('expired-popular-url', '<html>expired</html>', '# Expired');
-    for (let i = 0; i < 5; i++) {
-      assert.ok(testCache.get('expired-popular-url'));
+      testCache.set('expired-popular-url', '# Expired');
+      for (let i = 0; i < 5; i++) {
+        assert.ok(testCache.get('expired-popular-url'));
+      }
+
+      // Advance past the 50ms TTL so the popular entry is now expired
+      advance(51);
+
+      testCache.set('fresh-url', '# Fresh');
+      testCache.set('new-url', '# New');
+
+      assert.equal(testCache.get('expired-popular-url'), null, 'Expected expired popular URL to be purged');
+      assert.ok(testCache.get('fresh-url'), 'Expected fresh URL to remain cached');
+      assert.ok(testCache.get('new-url'), 'Expected new URL to remain cached');
+      assert.equal(testCache.getStats().size, 2);
+    } finally {
+      testCache?.destroy();
     }
-
-    await new Promise(resolve => setTimeout(resolve, 80));
-
-    testCache.set('fresh-url', '<html>fresh</html>', '# Fresh');
-    testCache.set('new-url', '<html>new</html>', '# New');
-
-    assert.equal(testCache.get('expired-popular-url'), null, 'Expected expired popular URL to be purged');
-    assert.ok(testCache.get('fresh-url'), 'Expected fresh URL to remain cached');
-    assert.ok(testCache.get('new-url'), 'Expected new URL to remain cached');
-    assert.equal(testCache.getStats().size, 2);
-
-    testCache.destroy();
-  }, results);
+  }), results);
 
   await testFunction('Cache normalizes invalid cleanup interval to default', () => {
     const testCache = new SimpleCache(1000, 500, Number.NaN);
@@ -207,10 +281,10 @@ async function runTests() {
     const testCache = new SimpleCache();
 
     try {
-      testCache.set('url1', '<html>1</html>', '# 1');
-      testCache.set('url2', '<html>2</html>', '# 2');
-      testCache.set('url3', '<html>3</html>', '# 3');
-      testCache.set('url4', '<html>4</html>', '# 4');
+      testCache.set('url1', '# 1');
+      testCache.set('url2', '# 2');
+      testCache.set('url3', '# 3');
+      testCache.set('url4', '# 4');
 
       assert.equal(testCache.getStats().size, 3);
       assert.equal(testCache.get('url1'), null);
@@ -231,7 +305,7 @@ async function runTests() {
     // Test that global cache exists and works
     urlCache.clear(); // Start fresh
 
-    urlCache.set('global-test', '<html>global</html>', '# Global');
+    urlCache.set('global-test', '# Global');
     const entry = urlCache.get('global-test');
 
     assert.ok(entry);
@@ -240,37 +314,46 @@ async function runTests() {
     urlCache.clear();
   }, results);
 
-  await testFunction('Cache get() returns null after TTL expiry', async () => {
-    const testCache = new SimpleCache(50); // 50ms TTL
+  await testFunction('Cache get() returns null after TTL expiry', () => withControlledClock((advance) => {
+    let testCache: SimpleCache | undefined;
+    try {
+      testCache = new SimpleCache(50); // 50ms TTL
 
-    testCache.set('cleanup-test', '<html>test</html>', '# Test');
+      testCache.set('cleanup-test', '# Test');
 
-    // Wait for cleanup to run
-    await new Promise(resolve => setTimeout(resolve, 150));
+      // Advance past the TTL
+      advance(51);
 
-    // Entry should be cleaned up
-    assert.equal(testCache.get('cleanup-test'), null);
+      assert.equal(testCache.get('cleanup-test'), null);
+    } finally {
+      testCache?.destroy();
+    }
+  }), results);
 
-    testCache.destroy();
-  }, results);
+  await testFunction('Cache cleanup interval removes expired entries', () => withControlledClock(async (advance) => {
+    // The expiry decision is deterministic via the controlled clock; only the 1ms
+    // interval *firing* needs real time (a scheduler dependency, not the flaky
+    // wall-clock-vs-timer one). Assert via getStats() — which does NOT lazily
+    // expire — so this verifies the background interval purged the entry rather
+    // than get()'s own expiry check.
+    let testCache: SimpleCache | undefined;
+    try {
+      testCache = new SimpleCache(50, 500, 1); // 50ms TTL, 1ms cleanup interval
 
-  await testFunction('Cache cleanup interval removes expired entries', async () => {
-    // Use 50ms TTL and 1ms cleanup interval so the interval fires quickly
-    const testCache = new SimpleCache(50, 500, 1);
+      testCache.set('cleanup-target', '# Test');
+      assert.equal(testCache.getStats().size, 1);
 
-    testCache.set('cleanup-target', '<html>test</html>', '# Test');
+      // Logically expire the entry, then let the 1ms interval fire and purge it.
+      advance(51);
+      for (let i = 0; i < 100 && testCache.getStats().size > 0; i++) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
 
-    // Confirm entry exists immediately
-    assert.ok(testCache.get('cleanup-target'));
-
-    // Wait for TTL to expire (50ms) + a few cleanup ticks (5ms buffer)
-    await new Promise(resolve => setTimeout(resolve, 80));
-
-    // Cleanup interval has fired and should have removed the expired entry
-    assert.equal(testCache.get('cleanup-target'), null);
-
-    testCache.destroy();
-  }, results);
+      assert.equal(testCache.getStats().size, 0, 'Expected cleanup interval to purge the expired entry');
+    } finally {
+      testCache?.destroy();
+    }
+  }), results);
 
   await testFunction('Cache cleanup interval does not keep process alive', () => {
     const testCache = new SimpleCache(1000, 500, 1000);

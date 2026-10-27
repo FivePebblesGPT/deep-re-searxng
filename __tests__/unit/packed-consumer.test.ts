@@ -1,0 +1,688 @@
+#!/usr/bin/env tsx
+
+import { strict as assert } from 'node:assert';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import {
+  assertMcpSmokeResponses, assertArtifactMetadata, assertPublishWorkflowContract,
+  assertSafeDependencyTree, assertZeroProductionAudit, runCheckedCommand,
+  verifyPackedConsumer, normalizePackReport,
+} from '../../scripts/verify-packed-consumer.mjs';
+import {
+  createTestResults,
+  printTestSummary,
+  testFunction,
+  TestResult,
+} from '../helpers/test-utils.js';
+import {
+  commandResult, installedPackage, invalidPublishWorkflows, safeTree, SpawnCall,
+  treeWithCoreZodRange, treeWithMcpMetadata, treeWithNodeServer, treeWithZod, validMcpSmokeOutput,
+  validWorkflow, zeroAudit,
+} from './packed-consumer-fixtures.js';
+
+const results = createTestResults();
+
+async function runDependencyContractTests(): Promise<void> {
+  await testFunction('accepts an exact v2 runtime dependency tree', () => {
+    assert.deepEqual(assertSafeDependencyTree(safeTree, installedPackage), [
+      { name: '@modelcontextprotocol/core', version: '2.4.0' },
+      { name: '@modelcontextprotocol/node', version: '2.1.2' },
+      { name: '@modelcontextprotocol/server', version: '2.4.0' },
+      { name: 'zod', version: '4.5.4' },
+    ]);
+  }, results);
+
+  await testFunction('rejects every mismatched, prerelease, missing, or malformed v2 runtime tree', () => {
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithNodeServer({ version: '1.19.17' }), installedPackage),
+      /unsafe_dependency_tree:.*1\.19\.17/,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithNodeServer({ version: '2.0.0-beta.1' }), installedPackage),
+      /unsafe_dependency_tree:.*2\.0\.0-beta\.1/,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree({ name: 'consumer', dependencies: {} }, installedPackage),
+      /unsafe_dependency_tree:.*missing/,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithNodeServer({}), installedPackage),
+      /unsafe_dependency_tree:.*version/,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithNodeServer({ version: 'not-semver' }), installedPackage),
+      /unsafe_dependency_tree:.*not-semver/,
+    );
+  }, results);
+
+  await testFunction('rejects invalid, extraneous, npm-problem, and mixed-version trees', () => {
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithNodeServer({ version: '2.4.0', invalid: true }), installedPackage),
+      /unsafe_dependency_tree:.*invalid/,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithNodeServer({ version: '2.4.0', extraneous: true }), installedPackage),
+      /unsafe_dependency_tree:.*extraneous/,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree({
+        ...safeTree,
+        problems: ['invalid: dependency tree'],
+      }, installedPackage),
+      /unsafe_dependency_tree:.*problems/,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree({
+        ...safeTree,
+        dependencies: {
+          ...safeTree.dependencies,
+          '@modelcontextprotocol/server': { version: '1.19.17' },
+        },
+      }, installedPackage),
+      /unsafe_dependency_tree:.*1\.19\.17/,
+    );
+  }, results);
+
+  await testFunction('derives exact Zod from the packed manifest and validates the complete production tree', () => {
+    assert.throws(
+      () => assertSafeDependencyTree(safeTree, {
+        ...installedPackage,
+        dependencies: { ...installedPackage.dependencies, zod: '^4.5.4' },
+      }),
+      /unsafe_dependency_tree:.*packed manifest zod.*exact stable/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(safeTree, {
+        ...installedPackage,
+        dependencies: {
+          '@modelcontextprotocol/core': '2.4.0',
+          '@modelcontextprotocol/node': '2.1.2',
+          '@modelcontextprotocol/server': '2.4.0',
+        },
+      }),
+      /unsafe_dependency_tree:.*packed manifest zod.*exact stable/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithZod({
+        version: '4.2.0',
+        path: '/consumer/node_modules/zod',
+      }), installedPackage),
+      /unsafe_dependency_tree:.*zod.*4\.2\.0.*4\.5\.4/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithCoreZodRange('^5.0.0'), installedPackage),
+      /unsafe_dependency_tree:.*zod.*range/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithCoreZodRange('latest'), installedPackage),
+      /unsafe_dependency_tree:.*zod.*range/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithMcpMetadata(
+        '@modelcontextprotocol/core',
+        { _dependencies: {} },
+      ), installedPackage),
+      /unsafe_dependency_tree:.*core.*required zod range.*missing/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithMcpMetadata(
+        '@modelcontextprotocol/server',
+        { _dependencies: { '@modelcontextprotocol/core': '2.4.0' } },
+      ), installedPackage),
+      /unsafe_dependency_tree:.*server.*required zod range.*missing/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithMcpMetadata(
+        '@modelcontextprotocol/core',
+        { peerDependencies: { zod: '^5.0.0' } },
+      ), installedPackage),
+      /unsafe_dependency_tree:.*peerDependencies.*zod.*range/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithMcpMetadata(
+        '@modelcontextprotocol/server',
+        { optionalDependencies: { zod: '^5.0.0' } },
+      ), installedPackage),
+      /unsafe_dependency_tree:.*optionalDependencies.*zod.*range/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree({
+        ...safeTree,
+        dependencies: {
+          'mcp-searxng': {
+            ...safeTree.dependencies['mcp-searxng'],
+            dependencies: {
+              ...safeTree.dependencies['mcp-searxng'].dependencies,
+              '@modelcontextprotocol/extra': {
+                version: '2.1.0',
+                path: '/consumer/node_modules/@modelcontextprotocol/extra',
+                _dependencies: { zod: '^5.0.0' },
+              },
+            },
+          },
+        },
+      }, installedPackage),
+      /unsafe_dependency_tree:.*zod.*range/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithZod({
+        version: '4.5.4',
+        path: '/consumer/node_modules/zod-second',
+        dependencies: {
+          zod: { version: '4.5.4', path: '/consumer/node_modules/zod' },
+        },
+      }), installedPackage),
+      /unsafe_dependency_tree:.*exactly one.*zod/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithZod({
+        version: '4.5.4',
+        path: '/consumer/node_modules/zod',
+        invalid: true,
+      }), installedPackage),
+      /unsafe_dependency_tree:.*zod.*invalid/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithZod({
+        version: '4.5.4',
+        path: '/consumer/node_modules/zod',
+        extraneous: true,
+      }), installedPackage),
+      /unsafe_dependency_tree:.*zod.*extraneous/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithZod({
+        version: '4.5.4',
+        path: '/consumer/node_modules/zod',
+        problems: ['invalid: zod tree'],
+      }), installedPackage),
+      /unsafe_dependency_tree:.*problems/iu,
+    );
+    assert.throws(
+      () => assertSafeDependencyTree(treeWithZod({}), installedPackage),
+      /unsafe_dependency_tree:.*zod.*version/iu,
+    );
+  }, results);
+
+  await testFunction('accepts only a well-formed zero-total production audit', () => {
+    assert.deepEqual(
+      assertZeroProductionAudit({
+        metadata: {
+          vulnerabilities: {
+            info: 0,
+            low: 0,
+            moderate: 0,
+            high: 0,
+            critical: 0,
+            total: 0,
+          },
+        },
+      }),
+      {
+        info: 0,
+        low: 0,
+        moderate: 0,
+        high: 0,
+        critical: 0,
+        total: 0,
+      },
+    );
+    assert.throws(
+      () => assertZeroProductionAudit({
+        metadata: { vulnerabilities: { total: 1 } },
+      }),
+      /audit_gate:.*1/,
+    );
+    assert.throws(
+      () => assertZeroProductionAudit({ metadata: {} }),
+      /audit_gate:.*metadata/,
+    );
+    assert.throws(
+      () => assertZeroProductionAudit({
+        metadata: { vulnerabilities: { total: '0' } },
+      }),
+      /audit_gate:.*numeric/,
+    );
+  }, results);
+}
+
+async function runProcessContractTests(): Promise<void> {
+  await testFunction('classifies command timeout, spawn, signal, and exit failures as infrastructure errors', () => {
+    const baseOptions = { cwd: '.', env: {}, timeoutMs: 1000 };
+    assert.throws(
+      () => runCheckedCommand('npm', ['install'], {
+        ...baseOptions,
+        spawn: () => commandResult({
+          error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }),
+          status: null,
+        }),
+      }),
+      /infrastructure:.*timeout/,
+    );
+    assert.throws(
+      () => runCheckedCommand('npm', ['install'], {
+        ...baseOptions,
+        spawn: () => commandResult({
+          error: new Error('spawn failed'),
+          status: null,
+        }),
+      }),
+      /infrastructure:.*spawn failed/,
+    );
+    assert.throws(
+      () => runCheckedCommand('npm', ['install'], {
+        ...baseOptions,
+        spawn: () => commandResult({
+          status: null,
+          signal: 'SIGTERM',
+        }),
+      }),
+      /infrastructure:.*SIGTERM/,
+    );
+    assert.throws(
+      () => runCheckedCommand('npm', ['install'], {
+        ...baseOptions,
+        spawn: () => commandResult({
+          status: 1,
+          stderr: 'registry unavailable',
+        }),
+      }),
+      /infrastructure:.*npm install.*status 1/,
+    );
+  }, results);
+
+  await testFunction('accepts successful MCP tools and resources from the packed CLI', () => {
+    assert.deepEqual(assertMcpSmokeResponses(validMcpSmokeOutput()), {
+      toolCount: 4,
+      resourceCount: 2,
+    });
+    assert.throws(
+      () => assertMcpSmokeResponses(JSON.stringify({ jsonrpc: '2.0', id: 2, result: { tools: [] } })),
+      /mcp_smoke:.*initialize/,
+    );
+    assert.throws(
+      () => assertMcpSmokeResponses([
+        JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -1 } }),
+        JSON.stringify({ jsonrpc: '2.0', id: 2, result: { tools: [] } }),
+      ].join('\n')),
+      /mcp_smoke:.*error/,
+    );
+    assert.throws(
+      () => assertMcpSmokeResponses([
+        JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }),
+        JSON.stringify({ jsonrpc: '2.0', id: 2, result: { tools: 'invalid' } }),
+      ].join('\n')),
+      /mcp_smoke:.*tools/,
+    );
+    assert.throws(
+      () => assertMcpSmokeResponses([
+        JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }),
+        JSON.stringify({ jsonrpc: '2.0', id: 2, result: { tools: [] } }),
+      ].join('\n')),
+      /mcp_smoke:.*expected/,
+    );
+    assert.throws(
+      () => assertMcpSmokeResponses(
+        validMcpSmokeOutput().split('\n').filter((line) => !line.includes('"id":3')).join('\n'),
+      ),
+      /mcp_smoke:.*resources\/list.*missing/iu,
+    );
+    assert.throws(
+      () => assertMcpSmokeResponses(
+        validMcpSmokeOutput().split('\n').filter((line) => !line.includes('"id":4')).join('\n'),
+      ),
+      /mcp_smoke:.*server-config.*missing/iu,
+    );
+  }, results);
+}
+
+async function runWorkflowContractTests(): Promise<void> {
+  await testFunction('requires an unsuppressed verifier before publish in the same job', () => {
+    assert.equal(assertPublishWorkflowContract(validWorkflow), true);
+
+    for (const workflow of invalidPublishWorkflows) {
+      assert.throws(
+        () => assertPublishWorkflowContract(workflow),
+        /workflow_contract:/,
+      );
+    }
+  }, results);
+
+  await testFunction('rejects forbidden metadata from the packed artifact', () => {
+    assert.equal(
+      assertArtifactMetadata(
+        {
+          filename: 'mcp-searxng-1.12.0.tgz',
+          files: [
+            { path: 'package.json' },
+            { path: 'dist/cli.js' },
+            { path: 'dist/pdf-worker.js' },
+          ],
+        },
+        {
+          name: 'mcp-searxng',
+          exports: {},
+          dependencies: {
+            '@modelcontextprotocol/server': '2.4.0',
+          },
+        },
+      ),
+      true,
+    );
+    assert.throws(
+      () => assertArtifactMetadata(
+        {
+          filename: 'mcp-searxng-1.12.0.tgz',
+          files: [
+            { path: 'package.json' },
+            { path: 'npm-shrinkwrap.json' },
+          ],
+        },
+        { name: 'mcp-searxng', exports: {}, dependencies: {} },
+      ),
+      /artifact_metadata:.*shrinkwrap/,
+    );
+    assert.throws(
+      () => assertArtifactMetadata(
+        {
+          filename: 'mcp-searxng-1.12.0.tgz',
+          files: [{ path: 'package.json' }, { path: 'dist/pdf-worker.js' }],
+        },
+        {
+          name: 'mcp-searxng',
+          exports: {},
+          dependencies: { '@modelcontextprotocol/sdk': '1.30.0' },
+        },
+      ),
+      /artifact_metadata:.*monolithic/,
+    );
+    assert.throws(
+      () => assertArtifactMetadata(
+        { filename: 'mcp-searxng-1.12.0.tgz', files: [null] },
+        { name: 'mcp-searxng', exports: {}, dependencies: {} },
+      ),
+      /artifact_metadata:.*file entry/,
+    );
+    assert.throws(
+      () => assertArtifactMetadata(
+        {
+          filename: 'mcp-searxng-1.12.0.tgz',
+          files: [{ path: 'package.json' }, { path: 'dist/cli.js' }],
+        },
+        { name: 'mcp-searxng', exports: {}, dependencies: {} },
+      ),
+      /artifact_metadata:.*pdf-worker\.js/,
+    );
+    assert.throws(
+      () => assertArtifactMetadata(
+        {
+          filename: 'mcp-searxng-1.12.0.tgz',
+          files: [{ path: 'package.json' }, { path: 'dist/pdf-worker.js' }],
+        },
+        {
+          name: 'mcp-searxng',
+          main: 'dist/index.js',
+          exports: {},
+          dependencies: {},
+        },
+      ),
+      /artifact_metadata:.*main entrypoint/,
+    );
+    assert.throws(
+      () => assertArtifactMetadata(
+        {
+          filename: 'mcp-searxng-1.12.0.tgz',
+          files: [{ path: 'package.json' }, { path: 'dist/pdf-worker.js' }],
+        },
+        {
+          name: 'mcp-searxng',
+          dependencies: {},
+        },
+      ),
+      /artifact_metadata:.*exports/,
+    );
+  }, results);
+
+  await testFunction('the public npm release workflow enforces the packed-consumer gate', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- repository-relative URL is a fixed test input
+    const workflow = readFileSync(
+      new URL('../../.github/workflows/npm-publish.yml', import.meta.url),
+      'utf8',
+    );
+    assert.equal(assertPublishWorkflowContract(workflow), true);
+  }, results);
+}
+
+async function runOrchestrationTests(): Promise<void> {
+  await testFunction('packs, installs, validates, audits, and smokes an isolated consumer in order', () => {
+    const calls: SpawnCall[] = [];
+    let temporaryRoot = '';
+    const artifactOutput = path.join(tmpdir(), `mcp-searxng-verified-${process.pid}-${Date.now()}.tgz`);
+    const credentialVariable = ['NODE', 'AUTH', 'TOKEN'].join('_');
+    const previousCredential = process.env[credentialVariable];
+    process.env[credentialVariable] = 'fixture-release-credential';
+    // #lizard forgives -- fake process dispatch mirrors five deterministic commands
+    const spawn = (
+      command: string,
+      args: string[],
+      options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number },
+    ) => {
+      calls.push({ command, args, options });
+      if (args.includes('pack')) {
+        const destination = args[args.indexOf('--pack-destination') + 1];
+        temporaryRoot = path.dirname(destination);
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- destination is the verifier-created temporary artifact directory
+        writeFileSync(path.join(destination, 'mcp-searxng-1.12.0.tgz'), 'fixture');
+        return {
+          status: 0,
+          signal: null,
+          stdout: JSON.stringify([{
+            filename: 'mcp-searxng-1.12.0.tgz',
+            files: [
+              { path: 'package.json' },
+              { path: 'dist/cli.js' },
+              { path: 'dist/pdf-worker.js' },
+            ],
+          }]),
+          stderr: '',
+        };
+      }
+      if (args.includes('install')) {
+        const consumerPackage = JSON.parse(
+          // eslint-disable-next-line security/detect-non-literal-fs-filename -- cwd is the verifier-created temporary consumer directory
+          readFileSync(path.join(options.cwd!, 'package.json'), 'utf8'),
+        );
+        assert.match(
+          consumerPackage.dependencies['mcp-searxng'],
+          /^file:.*mcp-searxng-1\.12\.0\.tgz$/,
+        );
+        const installedPackageDirectory = path.join(options.cwd!, 'node_modules', 'mcp-searxng');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- directory belongs to the verifier-created temporary consumer
+        mkdirSync(installedPackageDirectory, { recursive: true });
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- directory belongs to the verifier-created temporary consumer
+        writeFileSync(
+          path.join(installedPackageDirectory, 'package.json'),
+          JSON.stringify({
+            name: 'mcp-searxng',
+            exports: {},
+            dependencies: {
+              '@modelcontextprotocol/server': '2.4.0',
+              zod: '4.5.4',
+            },
+          }),
+        );
+        return { status: 0, signal: null, stdout: '', stderr: '' };
+      }
+      if (args.includes('ls')) {
+        return {
+          status: 0,
+          signal: null,
+          stdout: JSON.stringify(safeTree),
+          stderr: '',
+        };
+      }
+      if (args.includes('audit')) {
+        return {
+          status: 0,
+          signal: null,
+          stdout: JSON.stringify(zeroAudit),
+          stderr: '',
+        };
+      }
+      if (args.includes('--input-type=module')) {
+        return { status: 0, signal: null, stdout: 'packed-pdf-ok\n', stderr: '' };
+      }
+      return {
+        status: 0,
+        signal: null,
+        stdout: validMcpSmokeOutput(),
+        stderr: '',
+      };
+    };
+
+    let outcome;
+    try {
+      outcome = verifyPackedConsumer({
+        projectRoot: process.cwd(),
+        artifactOutput,
+        spawn,
+      });
+    } finally {
+      if (previousCredential === undefined) {
+        delete process.env[credentialVariable];
+      } else {
+        process.env[credentialVariable] = previousCredential;
+      }
+    }
+
+    assert.deepEqual(outcome.adapterVersions, [
+      { name: '@modelcontextprotocol/core', version: '2.4.0' },
+      { name: '@modelcontextprotocol/node', version: '2.1.2' },
+      { name: '@modelcontextprotocol/server', version: '2.4.0' },
+      { name: 'zod', version: '4.5.4' },
+    ]);
+    assert.equal(outcome.auditTotal, 0);
+    assert.equal(outcome.toolCount, 4);
+    assert.equal(outcome.resourceCount, 2);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- unique test output is created under the OS temporary directory
+    assert.equal(readFileSync(artifactOutput, 'utf8'), 'fixture');
+    assert.deepEqual(
+      calls.map(({ args }) => (
+        args.find((argument) => ['pack', 'install', 'ls', 'audit'].includes(argument))
+        ?? args[0]
+      )),
+      ['pack', 'install', '--input-type=module', 'ls', 'audit', path.join('node_modules', 'mcp-searxng', 'dist', 'cli.js')],
+    );
+    const installCall = calls[1];
+    assert.ok(installCall.args.includes('--ignore-scripts'));
+    assert.ok(installCall.args.includes('--fetch-retries=2'));
+    assert.ok(installCall.args.includes('--fetch-timeout=60000'));
+    assert.equal(installCall.options.timeout, 300_000);
+    assert.equal(installCall.options.env?.NPM_CONFIG_REGISTRY, 'https://registry.npmjs.org/');
+    for (const call of calls) {
+      assert.equal(call.options.env?.[credentialVariable], undefined);
+    }
+    const lsCall = calls.find(({ args }) => args.includes('ls'));
+    assert.deepEqual(lsCall?.args.slice(lsCall.args.indexOf('ls')), ['ls', '--all', '--long', '--json']);
+    assert.ok(installCall.options.env?.NPM_CONFIG_CACHE?.startsWith(temporaryRoot));
+    assert.ok(installCall.options.env?.NPM_CONFIG_USERCONFIG?.startsWith(temporaryRoot));
+    assert.ok(installCall.options.env?.NPM_CONFIG_GLOBALCONFIG?.startsWith(temporaryRoot));
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- path was captured from the verifier-created temporary directory
+    assert.equal(existsSync(temporaryRoot), false);
+    rmSync(artifactOutput, { force: true });
+  }, results);
+
+  await testFunction('removes the isolated consumer after a command failure', () => {
+    let temporaryRoot = '';
+    const spawn = (
+      _command: string,
+      args: string[],
+      _options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number },
+    ) => {
+      if (args.includes('pack')) {
+        const destination = args[args.indexOf('--pack-destination') + 1];
+        temporaryRoot = path.dirname(destination);
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- destination is the verifier-created temporary artifact directory
+        writeFileSync(path.join(destination, 'mcp-searxng-1.12.0.tgz'), 'fixture');
+        return {
+          status: 0,
+          signal: null,
+          stdout: JSON.stringify([{
+            filename: 'mcp-searxng-1.12.0.tgz',
+            files: [
+              { path: 'package.json' },
+              { path: 'dist/cli.js' },
+              { path: 'dist/pdf-worker.js' },
+            ],
+          }]),
+          stderr: '',
+        };
+      }
+      if (args.includes('install')) {
+        const installedPackageDirectory = path.join(_options.cwd!, 'node_modules', 'mcp-searxng');
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- directory belongs to the verifier-created temporary consumer
+        mkdirSync(installedPackageDirectory, { recursive: true });
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- directory belongs to the verifier-created temporary consumer
+        writeFileSync(
+          path.join(installedPackageDirectory, 'package.json'),
+          JSON.stringify({
+            name: 'mcp-searxng',
+            exports: {},
+            dependencies: {
+              '@modelcontextprotocol/server': '2.4.0',
+              zod: '4.5.4',
+            },
+          }),
+        );
+      }
+      if (args.includes('--input-type=module')) {
+        return { status: 0, signal: null, stdout: 'packed-pdf-ok\n', stderr: '' };
+      }
+      if (args.includes('ls')) {
+        return {
+          status: 1,
+          signal: null,
+          stdout: JSON.stringify(safeTree),
+          stderr: 'dependency tree unavailable',
+        };
+      }
+      return { status: 0, signal: null, stdout: '', stderr: '' };
+    };
+
+    assert.throws(
+      () => verifyPackedConsumer({ projectRoot: process.cwd(), spawn }),
+      /infrastructure:.*status 1/,
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- path was captured from the verifier-created temporary directory
+    assert.equal(existsSync(temporaryRoot), false);
+  }, results);
+}
+
+export async function runTests(): Promise<TestResult> {
+  console.log('Testing: packed consumer release verification\n');
+  await testFunction('normalizes npm array and npm 12 keyed pack reports without accepting ambiguity', () => {
+    const artifact = { filename: 'deep-re-searxng-2.9.0.tgz', files: [] };
+    assert.deepEqual(normalizePackReport([artifact]), [artifact]);
+    assert.deepEqual(normalizePackReport({ 'deep-re-searxng': artifact }), [artifact]);
+    for (const invalid of [null, [], {}, [artifact, artifact], { first: artifact, second: artifact }, { error: 'failed' }]) {
+      assert.throws(() => normalizePackReport(invalid), /exactly one artifact/);
+    }
+  }, results);
+  await runDependencyContractTests();
+  await runProcessContractTests();
+  await runWorkflowContractTests();
+  await runOrchestrationTests();
+  printTestSummary(results, 'Packed Consumer Verification');
+  return results;
+}
+
+if (
+  process.argv[1]
+  && import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  runTests().then((result) => {
+    if (result.failed > 0) process.exitCode = 1;
+  });
+}

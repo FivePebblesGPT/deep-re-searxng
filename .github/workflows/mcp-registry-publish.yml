@@ -1,0 +1,95 @@
+name: Publish MCP Registry
+
+on:
+  workflow_run:
+    workflows: [Publish NPM Package]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-registry-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish and verify MCP Registry entry
+    # workflow_run has publishing privileges: never run for PRs or fork code.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.path == '.github/workflows/npm-publish.yml' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Checkout trusted publication tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Read release metadata without executing release code
+        id: release
+        run: |
+          RELEASE_METADATA_DIRECTORY="$RUNNER_TEMP/registry-release"
+          echo "RELEASE_METADATA_DIRECTORY=$RELEASE_METADATA_DIRECTORY" >> "$GITHUB_ENV"
+          [[ "$RELEASE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git fetch --no-tags origin "$RELEASE_SHA"
+          mkdir -p "$RELEASE_METADATA_DIRECTORY"
+          git show "$RELEASE_SHA:.github/workflows/npm-publish.yml" > "$RELEASE_METADATA_DIRECTORY/npm-publish.yml"
+          if grep -q '^  publish-mcp-registry:' "$RELEASE_METADATA_DIRECTORY/npm-publish.yml"; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "This older release manages registry publication inside its npm workflow; no separate publication is needed." >> "$GITHUB_STEP_SUMMARY"
+          elif ! git cat-file -e "$RELEASE_SHA:.mcp/server.json"; then
+            if git cat-file -e "$RELEASE_SHA:.github/workflows/mcp-registry-publish.yml"; then
+              echo "::error::Release using the independent registry workflow is missing its required manifest."
+              exit 1
+            fi
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "This historical release has no MCP Registry manifest; skipping registry publication." >> "$GITHUB_STEP_SUMMARY"
+          else
+            git show "$RELEASE_SHA:package.json" > "$RELEASE_METADATA_DIRECTORY/package.json"
+            git show "$RELEASE_SHA:.mcp/server.json" > "$RELEASE_METADATA_DIRECTORY/server.json"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        if: steps.release.outputs.enabled == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Verify release identity
+        if: steps.release.outputs.enabled == 'true'
+        run: |
+          node scripts/publish-mcp-registry.mjs --validate
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$RELEASE_SHA"
+
+      - name: Install and verify mcp-publisher
+        if: steps.release.outputs.enabled == 'true'
+        env:
+          MCP_PUBLISHER_VERSION: "v1.7.9"
+          MCP_PUBLISHER_SHA256: "ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac"
+        run: |
+          curl --fail --silent --show-error --location --max-time 60 \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz" \
+            -o "$RUNNER_TEMP/mcp-publisher.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  $RUNNER_TEMP/mcp-publisher.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/mcp-publisher-bin"
+          tar -xz -C "$RUNNER_TEMP/mcp-publisher-bin" -f "$RUNNER_TEMP/mcp-publisher.tar.gz" mcp-publisher
+          chmod +x "$RUNNER_TEMP/mcp-publisher-bin/mcp-publisher"
+          echo "$RUNNER_TEMP/mcp-publisher-bin" >> "$GITHUB_PATH"
+
+      - name: Wait for npm, publish, and verify (up to 15 minutes)
+        if: steps.release.outputs.enabled == 'true'
+        run: node scripts/publish-mcp-registry.mjs

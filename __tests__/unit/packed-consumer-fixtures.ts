@@ -1,0 +1,279 @@
+export const safeTree = {
+  name: 'consumer',
+  version: '1.0.0',
+  dependencies: {
+    'mcp-searxng': {
+      version: '1.12.0',
+      path: '/consumer/node_modules/mcp-searxng',
+      dependencies: {
+        '@modelcontextprotocol/core': {
+          version: '2.4.0',
+          path: '/consumer/node_modules/@modelcontextprotocol/core',
+          _dependencies: { zod: '^4.2.0' },
+        },
+        '@modelcontextprotocol/node': {
+          version: '2.1.2',
+          path: '/consumer/node_modules/@modelcontextprotocol/node',
+          _dependencies: {},
+        },
+        '@modelcontextprotocol/server': {
+          version: '2.4.0',
+          path: '/consumer/node_modules/@modelcontextprotocol/server',
+          _dependencies: {
+            '@modelcontextprotocol/core': '2.4.0',
+            zod: '^4.2.0',
+          },
+        },
+        zod: {
+          version: '4.5.4',
+          path: '/consumer/node_modules/zod',
+        },
+      },
+    },
+  },
+};
+
+export const installedPackage = {
+  name: 'mcp-searxng',
+  dependencies: {
+    '@modelcontextprotocol/core': '2.4.0',
+    '@modelcontextprotocol/node': '2.1.2',
+    '@modelcontextprotocol/server': '2.4.0',
+    zod: '4.5.4',
+  },
+};
+
+export function treeWithZod(zod: object): object {
+  return {
+    ...safeTree,
+    dependencies: {
+      'mcp-searxng': {
+        ...safeTree.dependencies['mcp-searxng'],
+        dependencies: {
+          ...safeTree.dependencies['mcp-searxng'].dependencies,
+          zod,
+        },
+      },
+    },
+  };
+}
+
+export function treeWithCoreZodRange(range: unknown): object {
+  return {
+    ...safeTree,
+    dependencies: {
+      'mcp-searxng': {
+        ...safeTree.dependencies['mcp-searxng'],
+        dependencies: {
+          ...safeTree.dependencies['mcp-searxng'].dependencies,
+          '@modelcontextprotocol/core': {
+            ...safeTree.dependencies['mcp-searxng'].dependencies['@modelcontextprotocol/core'],
+            _dependencies: { zod: range },
+          },
+        },
+      },
+    },
+  };
+}
+
+export function treeWithMcpMetadata(
+  packageName: '@modelcontextprotocol/core' | '@modelcontextprotocol/server',
+  metadata: object,
+): object {
+  const current = packageName === '@modelcontextprotocol/core'
+    ? safeTree.dependencies['mcp-searxng'].dependencies['@modelcontextprotocol/core']
+    : safeTree.dependencies['mcp-searxng'].dependencies['@modelcontextprotocol/server'];
+  const replacement = { ...current, ...metadata };
+  const dependencies = packageName === '@modelcontextprotocol/core'
+    ? {
+        ...safeTree.dependencies['mcp-searxng'].dependencies,
+        '@modelcontextprotocol/core': replacement,
+      }
+    : {
+        ...safeTree.dependencies['mcp-searxng'].dependencies,
+        '@modelcontextprotocol/server': replacement,
+      };
+  return {
+    ...safeTree,
+    dependencies: {
+      'mcp-searxng': {
+        ...safeTree.dependencies['mcp-searxng'],
+        dependencies,
+      },
+    },
+  };
+}
+
+export const validWorkflow = `name: Publish
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test package
+        run: npm run test:coverage
+      - name: Build package
+        run: npm run build
+      - name: Verify packed consumer
+        run: npm run verify:packed-consumer -- --output "$RUNNER_TEMP/verified-package.tgz"
+      - name: Publish to npm
+        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance
+  publish-registry:
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo complete
+`;
+
+export const invalidPublishWorkflows = Object.freeze([
+    validWorkflow.replace(
+      '      - name: Test package\n        run: npm run test:coverage\n',
+      '',
+    ),
+    validWorkflow.replace(
+      '      - name: Verify packed consumer\n        run: npm run verify:packed-consumer -- --output "$RUNNER_TEMP/verified-package.tgz"',
+      '  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm run verify:packed-consumer',
+    ),
+    validWorkflow.replace(
+      '      - name: Build package\n        run: npm run build\n      - name: Verify packed consumer\n        run: npm run verify:packed-consumer -- --output "$RUNNER_TEMP/verified-package.tgz"',
+      '      - name: Verify packed consumer\n        run: npm run verify:packed-consumer -- --output "$RUNNER_TEMP/verified-package.tgz"\n      - name: Build package\n        run: npm run build',
+    ),
+    validWorkflow.replace(
+      '      - name: Publish to npm\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance',
+      '      - name: Publish to npm\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance\n        continue-on-error: true',
+    ),
+    validWorkflow.replace(
+      '    runs-on: ubuntu-latest',
+      '    continue-on-error: true\n    runs-on: ubuntu-latest',
+    ),
+    validWorkflow.replace(
+      '      - name: Publish to npm\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance',
+      '      - name: Publish to npm\n        if: always()\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance',
+    ),
+    validWorkflow.replace(
+      '      - name: Publish to npm\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance',
+      '      - name: Publish to npm\n        if: failure()\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance',
+    ),
+    validWorkflow.replace(
+      '        run: npm run verify:packed-consumer',
+      '        run: set +e; npm run verify:packed-consumer',
+    ),
+    validWorkflow.replace(
+      '        run: npm run verify:packed-consumer',
+      '        run: npm run verify:packed-consumer || true',
+    ),
+    validWorkflow.replace(
+      'npm publish "$RUNNER_TEMP/verified-package.tgz"',
+      'npm publish .',
+    ),
+    validWorkflow.replace(
+      '    runs-on: ubuntu-latest',
+      '    continue-on-error: true # forbidden\n    runs-on: ubuntu-latest',
+    ),
+    validWorkflow.replace(
+      '      - name: Publish to npm\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance',
+      '      - name: Publish to npm\n        if: always() # forbidden\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance',
+    ),
+    validWorkflow.replace(
+      '    runs-on: ubuntu-latest',
+      '    continue-on-error: ${{ true }}\n    runs-on: ubuntu-latest',
+    ),
+    validWorkflow.replace(
+      '      - name: Publish to npm\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance',
+      '      - name: Publish to npm\n        if: ${{ always() }}\n        run: npm publish "$RUNNER_TEMP/verified-package.tgz" --access public --provenance',
+    ),
+    validWorkflow.replace(
+      '        run: npm run verify:packed-consumer',
+      '        run: npm run verify:packed-consumer||true',
+    ),
+]);
+
+export interface SpawnCall {
+  command: string;
+  args: string[];
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number };
+}
+
+export const zeroAudit = {
+  metadata: {
+    vulnerabilities: {
+      info: 0,
+      low: 0,
+      moderate: 0,
+      high: 0,
+      critical: 0,
+      total: 0,
+    },
+  },
+};
+
+export function commandResult(overrides: object): object {
+  return {
+    error: undefined,
+    status: 0,
+    signal: null,
+    stdout: '',
+    stderr: '',
+    ...overrides,
+  };
+}
+
+export function treeWithNodeServer(nodeServer: object): object {
+  return {
+    ...safeTree,
+    dependencies: {
+      'mcp-searxng': {
+        ...safeTree.dependencies['mcp-searxng'],
+        dependencies: {
+          ...safeTree.dependencies['mcp-searxng'].dependencies,
+          '@modelcontextprotocol/server': nodeServer,
+        },
+      },
+    },
+  };
+}
+
+export function validMcpSmokeOutput(): string {
+  return [
+    JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      result: { protocolVersion: '2024-11-05' },
+    }),
+    JSON.stringify({
+      jsonrpc: '2.0',
+      id: 2,
+      result: {
+        tools: [
+          { name: 'searxng_web_search' },
+          { name: 'web_url_read' },
+          { name: 'searxng_search_suggestions' },
+          { name: 'searxng_instance_info' },
+        ],
+      },
+    }),
+    JSON.stringify({
+      jsonrpc: '2.0',
+      id: 3,
+      result: {
+        resources: [
+          { uri: 'config://server-config', name: 'Server Configuration' },
+          { uri: 'help://usage-guide', name: 'Usage Guide' },
+        ],
+      },
+    }),
+    JSON.stringify({
+      jsonrpc: '2.0',
+      id: 4,
+      result: {
+        contents: [{ uri: 'config://server-config', text: '{}' }],
+      },
+    }),
+    JSON.stringify({
+      jsonrpc: '2.0',
+      id: 5,
+      result: {
+        contents: [{ uri: 'help://usage-guide', text: '# Usage' }],
+      },
+    }),
+  ].join('\n');
+}

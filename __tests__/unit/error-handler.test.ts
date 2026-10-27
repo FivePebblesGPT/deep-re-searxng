@@ -22,10 +22,16 @@ import {
   createTimeoutError,
   createEmptyContentWarning,
   createUnexpectedError,
-  validateEnvironment
+  validateEnvironment,
+  handleUncaughtException,
+  handleUnhandledRejection
 } from '../../src/error-handler.js';
 import { testFunction, createTestResults, printTestSummary } from '../helpers/test-utils.js';
 import { EnvManager } from '../helpers/env-utils.js';
+import {
+  initializeDiagnosticSanitizer,
+  resetDiagnosticSanitizerForTests,
+} from '../../src/diagnostic-sanitizer.js';
 
 const results = createTestResults();
 const envManager = new EnvManager();
@@ -96,11 +102,17 @@ async function runTests() {
   await testFunction('Specialized error creators', () => {
     const context = { searxngUrl: 'https://searx.example.com' };
     
-    assert.ok(createJSONError('invalid json', context) instanceof MCPSearXNGError);
-    assert.ok(createDataError({}, context) instanceof MCPSearXNGError);
+    const jsonError = createJSONError('invalid json');
+    assert.ok(jsonError instanceof MCPSearXNGError);
+    assert.ok(jsonError.message.includes('Invalid JSON format'));
+    assert.ok(!jsonError.message.includes('invalid json'));
+    assert.ok(jsonError.message.includes('- json'));
+    assert.ok(jsonError.message.includes('search.formats'));
+    assert.ok(jsonError.message.includes('SEARXNG_HTML_FALLBACK=true'));
+    assert.ok(createDataError() instanceof MCPSearXNGError);
     assert.ok(createURLFormatError('invalid-url') instanceof MCPSearXNGError);
     assert.ok(createContentError('test error', 'https://example.com') instanceof MCPSearXNGError);
-    assert.ok(createConversionError(new Error('test'), 'https://example.com', '<html>') instanceof MCPSearXNGError);
+    assert.ok(createConversionError('https://example.com') instanceof MCPSearXNGError);
     assert.ok(createTimeoutError(5000, 'https://example.com') instanceof MCPSearXNGError);
     assert.ok(createUnexpectedError(new Error('test'), context) instanceof MCPSearXNGError);
   }, results);
@@ -109,17 +121,19 @@ async function runTests() {
     assert.ok(typeof createNoResultsMessage('test query') === 'string');
     assert.ok(createNoResultsMessage('test').includes('No results found'));
     
-    const warning = createEmptyContentWarning('https://example.com', 100, '<html>');
+    const warning = createEmptyContentWarning('https://example.com');
     assert.ok(typeof warning === 'string');
     assert.ok(warning.includes('Content Warning'));
   }, results);
 
-  await testFunction('createEmptyContentWarning with various content', () => {
-    const contents = ['', '<html></html>', '<div>content</div>', 'plain text'];
-    for (const content of contents) {
-      const warning = createEmptyContentWarning('https://test.com', content.length, content);
-      assert.ok(typeof warning === 'string');
-    }
+  await testFunction('createEmptyContentWarning includes the URL', () => {
+    const warning = createEmptyContentWarning('https://test.com');
+    // Exact-match the full message (not url.includes) — a substring URL check
+    // trips CodeQL's incomplete-URL-sanitization rule and asserts less anyway.
+    assert.equal(
+      warning,
+      '📄 Content Warning: Page fetched but appears empty after conversion (https://test.com). May contain only media or require JavaScript.'
+    );
   }, results);
 
   await testFunction('validateEnvironment success', () => {
@@ -128,6 +142,52 @@ async function runTests() {
     const result = validateEnvironment();
     assert.equal(result, null);
     
+    envManager.restore();
+  }, results);
+
+  await testFunction('validateEnvironment accepts valid multi-URL SEARXNG_URL list', () => {
+    envManager.set('SEARXNG_URL', 'https://one.example.com; http://two.example.com:8080 ');
+
+    const result = validateEnvironment();
+    assert.equal(result, null);
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('validateEnvironment accepts distinct simultaneous browser solver providers', () => {
+    envManager.set('SEARXNG_URL', 'https://valid-url.com');
+    envManager.set('FLARESOLVERR_URL', 'http://flare-secret.example');
+    envManager.set('BYPARR_URL', 'http://byparr-secret.example');
+
+    const result = validateEnvironment();
+    assert.equal(result, null);
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('validateEnvironment rejects duplicate browser solver endpoints without values', () => {
+    envManager.set('SEARXNG_URL', 'https://valid-url.com');
+    envManager.set('FLARESOLVERR_URL', 'http://solver-secret.example/base');
+    envManager.set('BYPARR_URL', 'http://SOLVER-SECRET.EXAMPLE:80/base/v1/');
+
+    const result = validateEnvironment();
+    assert.ok(result?.includes('different services'));
+    assert.ok(!result?.includes('solver-secret'));
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('validateEnvironment rejects invalid browser solver endpoints without echoing them', () => {
+    envManager.set('SEARXNG_URL', 'https://valid-url.com');
+    envManager.delete('FLARESOLVERR_URL');
+    const sensitiveUserinfo = ['operator', 'credential-value'].join(':');
+    envManager.set('BYPARR_URL', `http://${sensitiveUserinfo}@byparr-secret.example`);
+
+    const result = validateEnvironment();
+    assert.ok(result?.includes('BYPARR_URL'));
+    assert.ok(!result?.includes(sensitiveUserinfo));
+    assert.ok(!result?.includes('byparr-secret'));
+
     envManager.restore();
   }, results);
 
@@ -148,6 +208,18 @@ async function runTests() {
     assert.ok(typeof result === 'string');
     assert.ok(result!.includes('invalid format') || result!.includes('invalid protocol') || result!.includes('Configuration Issues'));
     
+    envManager.restore();
+  }, results);
+
+  await testFunction('validateEnvironment - invalid entry in multi-URL list reports offending entry', () => {
+    envManager.set('SEARXNG_URL', 'https://valid.example.com;not-a-valid-url');
+
+    const result = validateEnvironment();
+    assert.ok(typeof result === 'string');
+    assert.ok(result!.includes('Configuration Issues'));
+    assert.ok(result!.includes('entry 2'));
+    assert.ok(!result!.includes('not-a-valid-url'));
+
     envManager.restore();
   }, results);
 
@@ -191,6 +263,17 @@ async function runTests() {
     envManager.restore();
   }, results);
 
+  await testFunction('validateEnvironment - empty-only multi-URL list is treated as not set', () => {
+    for (const emptyList of ['', ';', ' ; ']) {
+      envManager.set('SEARXNG_URL', emptyList);
+      const result = validateEnvironment();
+      assert.ok(typeof result === 'string');
+      assert.ok(result!.includes('SEARXNG_URL not set'));
+    }
+
+    envManager.restore();
+  }, results);
+
   await testFunction('createNetworkError with searxngUrl context includes SEARXNG_URL guidance', () => {
     // Covers the truthy branch of the searxngUrl ternary
     const error = { message: 'fetch failed' };
@@ -227,6 +310,62 @@ async function runTests() {
     };
     const result = createNetworkError(error, { url: 'https://example.com' });
     assert.ok(result.message.includes('DEPTH_ZERO_SELF_SIGNED_CERT'), `Expected code in message, got: ${result.message}`);
+  }, results);
+
+  // --- Process-level crash handlers ---
+  // process.exit / console.error are stubbed so the handlers can be exercised
+  // without killing the test process or printing to the real console.
+  function captureExitAndError(fn: () => void): { exitCode: number | undefined; calls: unknown[][] } {
+    const originalExit = process.exit;
+    const originalError = console.error;
+    let exitCode: number | undefined;
+    const calls: unknown[][] = [];
+    process.exit = ((code?: number) => { exitCode = code; }) as unknown as typeof process.exit;
+    console.error = (...args: unknown[]) => { calls.push(args); };
+    try {
+      fn();
+    } finally {
+      process.exit = originalExit;
+      console.error = originalError;
+    }
+    return { exitCode, calls };
+  }
+
+  await testFunction('handleUncaughtException sanitizes the error and exits with code 1', () => {
+    resetDiagnosticSanitizerForTests();
+    initializeDiagnosticSanitizer({
+      AUTH_USERNAME: 'crash-user',
+      AUTH_PASSWORD: 'crash-secret',
+    });
+    const err = new Error('boom');
+    err.message = 'boom crash-user:crash-secret';
+    const { exitCode, calls } = captureExitAndError(() => handleUncaughtException(err));
+    assert.equal(exitCode, 1);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], 'Uncaught Exception:');
+    const output = String((calls[0][1] as Error).stack ?? calls[0][1]);
+    assert.ok(!output.includes('crash-user'), output);
+    assert.ok(!output.includes('crash-secret'), output);
+    resetDiagnosticSanitizerForTests();
+  }, results);
+
+  await testFunction('handleUnhandledRejection sanitizes the reason and exits with code 1', () => {
+    resetDiagnosticSanitizerForTests();
+    initializeDiagnosticSanitizer({
+      AUTH_USERNAME: 'reject-user',
+      AUTH_PASSWORD: 'reject-secret',
+    });
+    const reason = new Error('nope reject-user:reject-secret');
+    const promise = Promise.reject(reason);
+    promise.catch(() => {}); // settle it so the test process sees no real unhandled rejection
+    const { exitCode, calls } = captureExitAndError(() => handleUnhandledRejection(reason, promise));
+    assert.equal(exitCode, 1);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], 'Unhandled Rejection:');
+    const output = String((calls[0][1] as Error).stack ?? calls[0][1]);
+    assert.ok(!output.includes('reject-user'), output);
+    assert.ok(!output.includes('reject-secret'), output);
+    resetDiagnosticSanitizerForTests();
   }, results);
 
   printTestSummary(results, 'Error Handler Module');

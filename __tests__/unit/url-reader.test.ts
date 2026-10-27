@@ -13,16 +13,29 @@
 import { strict as assert } from 'node:assert';
 import * as http from 'node:http';
 import * as net from 'node:net';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import * as zlib from 'node:zlib';
 import { checkContentLength, fetchAndConvertToMarkdown } from '../../src/url-reader.js';
+import {
+  createBrowserSolverCacheKey,
+  MAX_BYPARR_RESPONSE_BYTES,
+  acquireBrowserSolverSolution,
+  resolveBrowserSolverConfigs,
+} from '../../src/browser-solver.js';
+import { createUrlReaderLookup } from '../../src/proxy.js';
+import { isUrlSecurityPolicyDnsError } from '../../src/url-security.js';
 import { urlCache } from '../../src/cache.js';
 import { testFunction, createTestResults, printTestSummary } from '../helpers/test-utils.js';
-import { createMockServer } from '../helpers/mock-server.js';
+import { createMockServer, createMockServerWithTracking } from '../helpers/mock-server.js';
 import { EnvManager } from '../helpers/env-utils.js';
+import { createTextPdf } from '../helpers/pdf-fixtures.js';
 
 const results = createTestResults();
 const envManager = new EnvManager();
+const require = createRequire(import.meta.url);
+const dnsModule = require('node:dns') as typeof import('node:dns');
+const TEST_PUBLIC_IP = '93.184.216.34';
 
 // ─── local test-server helpers ───────────────────────────────────────────────
 
@@ -71,6 +84,11 @@ function startHttpServer(handler: ServerHandler): Promise<TestServer> {
 function startConnectProxyServer(handler: ConnectProxyHandler): Promise<TestServer> {
   return new Promise((resolve, reject) => {
     const server = http.createServer();
+    const sockets = new Set<net.Socket>();
+    server.on('connection', socket => {
+      sockets.add(socket);
+      socket.once('close', () => sockets.delete(socket));
+    });
 
     server.on('connect', (req, socket) => {
       socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
@@ -94,6 +112,8 @@ function startConnectProxyServer(handler: ConnectProxyHandler): Promise<TestServ
         url: `http://127.0.0.1:${addr.port}`,
         close: () =>
           new Promise<void>((res) => {
+            // closeAllConnections excludes upgraded CONNECT sockets.
+            for (const socket of sockets) socket.destroy();
             server.closeAllConnections();
             server.close(() => res());
           }),
@@ -139,6 +159,42 @@ function getFreePort(): Promise<number> {
   });
 }
 
+type MockDnsRecords = Record<string, Array<{ address: string; family: 4 | 6 }>>;
+
+function installDnsLookupMock(recordsByHostname: MockDnsRecords): () => void {
+  const originalLookup = dnsModule.lookup;
+
+  (dnsModule as any).lookup = (hostname: string, options: any, callback?: any) => {
+    const cb = typeof options === 'function' ? options : callback;
+    if (net.isIP(hostname)) {
+      return (originalLookup as any).call(dnsModule, hostname, options, callback);
+    }
+
+    const records = recordsByHostname[hostname];
+
+    if (!records) {
+      const err = new Error(`Mock DNS has no records for ${hostname}`) as NodeJS.ErrnoException;
+      err.code = 'ENOTFOUND';
+      cb(err);
+      return;
+    }
+
+    if (options?.all) {
+      cb(null, records);
+      return;
+    }
+
+    const first = records[0];
+    cb(null, first.address, first.family);
+  };
+  syncBuiltinESMExports();
+
+  return () => {
+    (dnsModule as any).lookup = originalLookup;
+    syncBuiltinESMExports();
+  };
+}
+
 // ─── tests ───────────────────────────────────────────────────────────────────
 
 async function runTests() {
@@ -177,7 +233,779 @@ async function runTests() {
     }
   }, results);
 
+  for (const provider of ['FLARESOLVERR_URL', 'BYPARR_URL']) {
+    await testFunction(`${provider} consumes rendered HTML without a blocked replay and caches pagination`, async () => {
+      urlCache.clear();
+      let gets = 0;
+      let heads = 0;
+      let solves = 0;
+      const target = await startHttpServer((req, res) => {
+        if (req.method === 'GET') gets++;
+        else heads++;
+        res.writeHead(403);
+        res.end();
+      });
+      const solver = await startHttpServer((req, res) => {
+        req.resume();
+        solves++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', solution: {
+          url: target.url, status: 200, cookies: [], userAgent: 'browser',
+          headers: { 'Content-Type': 'text/html' },
+          response: '<html><body><h1>Rendered page</h1><p>Browser-only content</p></body></html>',
+        } }));
+      });
+      try {
+        envManager.set(provider, solver.url);
+        const result = await fetchAndConvertToMarkdown(createMockServer() as any, target.url);
+        assert.ok(result.includes('Browser-only content'));
+        const headings = await fetchAndConvertToMarkdown(createMockServer() as any, target.url, 1000, { readHeadings: true });
+        assert.equal(headings, '# Rendered page');
+        assert.equal(gets, 0);
+        assert.equal(heads, 1);
+        assert.equal(solves, 1);
+      } finally {
+        envManager.restore(); urlCache.clear();
+        await solver.close(); await target.close();
+      }
+    }, results);
+  }
+
+  await testFunction('retryable primary replay failure advances once to Byparr rendered content', async () => {
+    let gets = 0;
+    let secondary = 0;
+    const target = await startHttpServer((req, res) => {
+      if (req.method === 'GET') gets++;
+      res.writeHead(403); res.end();
+    });
+    const flare = await startHttpServer((req, res) => {
+      req.resume(); res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', solution: { url: target.url, status: 200, cookies: [], userAgent: 'browser', response: '<html><body></body></html>' } }));
+    });
+    const byparr = await startHttpServer((req, res) => {
+      req.resume(); secondary++; res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', solution: { url: target.url, status: 200, cookies: [], userAgent: 'browser', response: '<html><body>Secondary success</body></html>' } }));
+    });
+    try {
+      envManager.set('FLARESOLVERR_URL', flare.url); envManager.set('BYPARR_URL', byparr.url);
+      assert.ok((await fetchAndConvertToMarkdown(createMockServer() as any, target.url)).includes('Secondary success'));
+      assert.equal(gets, 1); assert.equal(secondary, 1);
+    } finally {
+      envManager.restore(); urlCache.clear();
+      await flare.close(); await byparr.close(); await target.close();
+    }
+  }, results);
+
+  await testFunction('Byparr consumes explicit base64 PDF without replay', async () => {
+    let gets = 0;
+    const target = await startHttpServer((req, res) => {
+      if (req.method === 'GET') gets++;
+      res.writeHead(403); res.end();
+    });
+    const solver = await startHttpServer((req, res) => {
+      req.resume(); res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', solution: {
+        url: target.url, status: 200, cookies: [], userAgent: 'browser',
+        headers: { 'content-type': 'application/pdf' },
+        response: Buffer.from(createTextPdf(['Browser PDF content'])).toString('base64'),
+      } }));
+    });
+    try {
+      envManager.set('BYPARR_URL', solver.url);
+      assert.ok((await fetchAndConvertToMarkdown(createMockServer() as any, target.url)).includes('Browser PDF content'));
+      assert.equal(gets, 0);
+    } finally {
+      envManager.restore(); urlCache.clear(); await solver.close(); await target.close();
+    }
+  }, results);
+
+  await testFunction('solver saturation returns busy without an unprotected direct fetch', async () => {
+    let gets = 0;
+    let notify!: () => void;
+    const entered = new Promise<void>(resolve => { notify = resolve; });
+    const target = await startHttpServer((req, res) => {
+      if (req.method === 'GET') gets++;
+      res.end();
+    });
+    const solver = await startHttpServer((req) => { req.resume(); notify(); });
+    const controller = new AbortController();
+    try {
+      envManager.set('FLARESOLVERR_URL', solver.url);
+      envManager.set('FLARESOLVERR_MAX_CONCURRENT_REQUESTS', '1');
+      envManager.set('FLARESOLVERR_TIMEOUT_MS', '20');
+      const server = createMockServer() as any;
+      const held = acquireBrowserSolverSolution(server, resolveBrowserSolverConfigs(server)[0], new URL(target.url), controller.signal);
+      const cancelled = assert.rejects(held, { name: 'AbortError' });
+      await entered;
+      await assert.rejects(fetchAndConvertToMarkdown(server, target.url), /solver is busy/);
+      assert.equal(gets, 0);
+      assert.equal(urlCache.getStats().size, 0);
+      controller.abort(); await cancelled;
+    } finally {
+      controller.abort(); envManager.restore(); urlCache.clear(); await solver.close(); await target.close();
+    }
+  }, results);
+
+  await testFunction('replay status classification respects rate limits and persistent client failures', async () => {
+    for (const scenario of [
+      { status: 403, retry: true }, { status: 408, retry: true }, { status: 503, retry: true },
+      { status: 404, retry: false }, { status: 401, retry: false }, { status: 429, retry: false },
+      { status: 503, retry: false, retryAfter: '60' },
+    ]) {
+      let secondary = 0;
+      const target = await startHttpServer((req, res) => {
+        res.writeHead(scenario.status, scenario.retryAfter ? { 'retry-after': scenario.retryAfter } : {}); res.end();
+      });
+      const flare = await startHttpServer((req, res) => {
+        req.resume(); res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', solution: { url: target.url, status: 200, cookies: [], userAgent: 'browser' } }));
+      });
+      const byparr = await startHttpServer((req, res) => {
+        req.resume(); secondary++; res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', solution: { url: target.url, status: 200, cookies: [], userAgent: 'browser', response: '<html>Recovered</html>' } }));
+      });
+      try {
+        envManager.set('FLARESOLVERR_URL', flare.url); envManager.set('BYPARR_URL', byparr.url);
+        const read = fetchAndConvertToMarkdown(createMockServer() as any, target.url);
+        if (scenario.retry) assert.ok((await read).includes('Recovered'));
+        else await assert.rejects(read, error => error instanceof Error && error.message.includes(String(scenario.status)));
+        assert.equal(secondary, scenario.retry ? 1 : 0);
+      } finally {
+        envManager.restore(); urlCache.clear(); await flare.close(); await byparr.close(); await target.close();
+      }
+    }
+  }, results);
+
+  await testFunction('a stalled replay body fails over after its independent timeout', async () => {
+    const target = await startHttpServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      if (req.method === 'HEAD') res.end();
+      else res.write('<html>partial');
+    });
+    const flare = await startHttpServer((req, res) => {
+      req.resume(); res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', solution: { url: target.url, status: 200, cookies: [], userAgent: 'browser' } }));
+    });
+    const byparr = await startHttpServer((req, res) => {
+      req.resume(); res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', solution: { url: target.url, status: 200, cookies: [], userAgent: 'browser', response: '<html>Complete secondary</html>' } }));
+    });
+    try {
+      envManager.set('FLARESOLVERR_URL', flare.url); envManager.set('BYPARR_URL', byparr.url);
+      const result = await fetchAndConvertToMarkdown(createMockServer() as any, target.url, 40);
+      assert.ok(result.includes('Complete secondary')); assert.ok(!result.includes('partial'));
+      assert.equal(urlCache.get(createBrowserSolverCacheKey('flaresolverr', target.url)), null);
+      envManager.delete('BYPARR_URL'); urlCache.clear();
+      await assert.rejects(fetchAndConvertToMarkdown(createMockServer() as any, target.url, 40), /Timeout Error/);
+    } finally { envManager.restore(); urlCache.clear(); await flare.close(); await byparr.close(); await target.close(); }
+  }, results);
+
+  await testFunction('terminal binary and empty-conversion replay results match direct reads without failover', async () => {
+    for (const scenario of [
+      { type: 'image/png', body: 'binary fixture' },
+      { type: 'text/html', body: '<html><body></body></html>' },
+    ]) {
+      let secondary = 0;
+      const target = await startHttpServer((req, res) => {
+        res.writeHead(200, { 'content-type': scenario.type }); res.end(req.method === 'HEAD' ? '' : scenario.body);
+      });
+      const flare = await startHttpServer((req, res) => {
+        req.resume(); res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', solution: { url: target.url, status: 200, cookies: [], userAgent: 'browser' } }));
+      });
+      const byparr = await startHttpServer((req, res) => { req.resume(); secondary++; res.writeHead(503); res.end(); });
+      try {
+        const server = createMockServer() as any;
+        const direct = await fetchAndConvertToMarkdown(server, target.url);
+        envManager.set('FLARESOLVERR_URL', flare.url); envManager.set('BYPARR_URL', byparr.url);
+        assert.equal(await fetchAndConvertToMarkdown(server, target.url), direct);
+        assert.equal(secondary, 0);
+      } finally { envManager.restore(); urlCache.clear(); await flare.close(); await byparr.close(); await target.close(); }
+    }
+  }, results);
+
+  await testFunction('browser wrappers preserve image JSON and plain-text replay behavior', async () => {
+    for (const scenario of [
+      { type: 'image/png', body: 'image fixture', wrapper: '<html><body><img src="https://example.com/image.png"></body></html>' },
+      { type: 'application/json', body: '{"value":42}', wrapper: '<html><body><pre>{"value":42}</pre></body></html>' },
+      { type: 'text/plain', body: 'Plain text fixture', wrapper: '<html><body><pre>Plain text fixture</pre></body></html>' },
+    ]) {
+      const target = await startHttpServer((req, res) => {
+        res.writeHead(200, { 'content-type': scenario.type }); res.end(req.method === 'HEAD' ? '' : scenario.body);
+      });
+      const flare = await startHttpServer((req, res) => {
+        req.resume(); res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', solution: { url: target.url, status: 200, cookies: [], userAgent: 'browser', response: scenario.wrapper } }));
+      });
+      try {
+        const server = createMockServer() as any;
+        const direct = await fetchAndConvertToMarkdown(server, target.url);
+        envManager.set('FLARESOLVERR_URL', flare.url);
+        assert.equal(await fetchAndConvertToMarkdown(server, target.url), direct);
+      } finally { envManager.restore(); urlCache.clear(); await flare.close(); await target.close(); }
+    }
+  }, results);
+
+  await testFunction('rendered content is withheld when the final hostname resolves private after solving', async () => {
+    const records: MockDnsRecords = { 'public.example': [{ address: TEST_PUBLIC_IP, family: 4 }] };
+    const restoreDns = installDnsLookupMock(records);
+    let gets = 0;
+    const proxy = await startConnectProxyServer((_authority, request) => {
+      if (request.startsWith('GET')) gets++;
+      return { status: 200, body: '' };
+    });
+    const solver = await startHttpServer((req, res) => {
+      req.resume(); records['public.example'] = [{ address: '127.0.0.1', family: 4 }];
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', solution: { url: 'http://public.example/page', status: 200, cookies: [], userAgent: 'browser', response: '<html><body>Private content</body></html>' } }));
+    });
+    try {
+      envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+      envManager.set('FLARESOLVERR_URL', solver.url); envManager.set('URL_READER_HTTP_PROXY', proxy.url);
+      await assert.rejects(fetchAndConvertToMarkdown(createMockServer() as any, 'http://public.example/page'), /blocked by security policy/);
+      assert.equal(gets, 0); assert.equal(urlCache.getStats().size, 0);
+    } finally { restoreDns(); envManager.restore(); urlCache.clear(); await solver.close(); await proxy.close(); }
+  }, results);
+
+  await testFunction('malformed solver PDF fails closed without replay or caching', async () => {
+    let gets = 0;
+    const target = await startHttpServer((req, res) => { if (req.method === 'GET') gets++; res.end(); });
+    const solver = await startHttpServer((req, res) => {
+      req.resume(); res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', solution: { url: target.url, status: 200, cookies: [], userAgent: 'browser', contentType: 'application/pdf', response: 'bm90IGEgcGRm' } }));
+    });
+    try {
+      envManager.set('BYPARR_URL', solver.url);
+      await assert.rejects(fetchAndConvertToMarkdown(createMockServer() as any, target.url), /invalid PDF/);
+      assert.equal(gets, 0); assert.equal(urlCache.getStats().size, 0);
+    } finally { envManager.restore(); urlCache.clear(); await solver.close(); await target.close(); }
+  }, results);
+
   // ── network-error wrapping ────────────────────────────────────────────────
+
+  await testFunction('configured FlareSolverr session is replayed with its user agent and cookies', async () => {
+    urlCache.clear();
+    let targetGetCount = 0;
+    let targetGetPath = '';
+    let receivedUserAgent = '';
+    let receivedCookie = '';
+    const target = await startHttpServer((req, res) => {
+      const isHeadRequest = req.method === 'HEAD';
+      if (!isHeadRequest) {
+        targetGetCount++;
+        targetGetPath = req.url as string;
+        receivedUserAgent = req.headers['user-agent'] as string;
+        receivedCookie = req.headers.cookie as string;
+      }
+      if (isHeadRequest) {
+        res.writeHead(403, {
+          'content-type': 'text/html; charset=utf-8',
+        });
+        res.end();
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+      });
+      res.end('<html><body><h1>Solved page</h1></body></html>');
+    });
+    let solverRequest: Record<string, unknown> | null = null;
+    const solver = await startHttpServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        solverRequest = JSON.parse(body) as Record<string, unknown>;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'ok',
+          solution: {
+            url: `${target.url}/solver-final`,
+            status: 200,
+            cookies: [{
+              name: 'cf_clearance',
+              value: 'clearance-token',
+              domain: '127.0.0.1',
+              path: '/',
+            }],
+            userAgent: 'flaresolverr-browser-agent',
+          },
+        }));
+      });
+    });
+
+    try {
+      envManager.set('FLARESOLVERR_URL', solver.url);
+      envManager.set('NO_PROXY', '127.0.0.1');
+      const requestedUrl = `${target.url}/original`;
+      const result = await fetchAndConvertToMarkdown(createMockServer() as any, requestedUrl);
+
+      assert.ok(result.includes('# Solved page'));
+      assert.equal(targetGetCount, 1);
+      assert.equal(targetGetPath, '/original');
+      assert.equal(receivedUserAgent, 'flaresolverr-browser-agent');
+      assert.equal(receivedCookie, 'cf_clearance=clearance-token');
+      assert.equal(solverRequest?.cmd, 'request.get');
+      assert.equal(solverRequest?.url, requestedUrl);
+      assert.equal(solverRequest?.returnOnlyCookies, false);
+    } finally {
+      envManager.restore();
+      urlCache.clear();
+      await solver.close();
+      await target.close();
+    }
+  }, results);
+
+  await testFunction('transient FlareSolverr failure falls back once to the direct fetch path', async () => {
+    urlCache.clear();
+    let targetGetCount = 0;
+    let targetHeadCount = 0;
+    const target = await startHttpServer((req, res) => {
+      if (req.method === 'GET') {
+        targetGetCount++;
+      } else if (req.method === 'HEAD') {
+        targetHeadCount++;
+      }
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(req.method === 'HEAD' ? '' : '<html><body><h1>Direct fallback</h1></body></html>');
+    });
+    let solverPostCount = 0;
+    const solver = await startHttpServer((req, res) => {
+      if (req.method === 'POST') {
+        solverPostCount++;
+      }
+      res.writeHead(503, { 'content-type': 'text/plain' });
+      res.end('unavailable');
+    });
+
+    try {
+      envManager.set('FLARESOLVERR_URL', solver.url);
+      envManager.set('NO_PROXY', '127.0.0.1');
+      const result = await fetchAndConvertToMarkdown(createMockServer() as any, target.url);
+
+      assert.ok(result.includes('# Direct fallback'));
+      assert.equal(solverPostCount, 1);
+      assert.equal(targetGetCount, 1);
+      assert.equal(targetHeadCount, 1);
+      assert.equal(urlCache.getStats().size, 0);
+    } finally {
+      envManager.restore();
+      urlCache.clear();
+      await solver.close();
+      await target.close();
+    }
+  }, results);
+
+  await testFunction('final malformed, top-level-error, and oversized responses direct-fetch once', async () => {
+    const scenarios = [
+      { name: 'malformed', body: '{"status":' },
+      { name: 'top-level-error', body: JSON.stringify({ status: 'error' }) },
+      {
+        name: 'oversized',
+        body: JSON.stringify({
+          status: 'error',
+          response: 'x'.repeat(MAX_BYPARR_RESPONSE_BYTES + 1024),
+        }),
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      urlCache.clear();
+      let targetGets = 0;
+      let flarePosts = 0;
+      let byparrPosts = 0;
+      const target = await startHttpServer((req, res) => {
+        if (req.method === 'GET') {
+          targetGets++;
+        }
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(req.method === 'HEAD' ? '' : '<h1>Dual direct fallback</h1>');
+      });
+      const flare = await startHttpServer((_req, res) => {
+        flarePosts++;
+        res.writeHead(503);
+        res.end();
+      });
+      const byparr = await startHttpServer((_req, res) => {
+        byparrPosts++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(scenario.body);
+      });
+
+      try {
+        envManager.set('FLARESOLVERR_URL', flare.url);
+        envManager.set('BYPARR_URL', byparr.url);
+        envManager.set('NO_PROXY', '127.0.0.1');
+        const result = await fetchAndConvertToMarkdown(
+          createMockServer() as any,
+          target.url,
+        );
+        assert.ok(result.includes('# Dual direct fallback'), scenario.name);
+        assert.equal(flarePosts, 1, scenario.name);
+        assert.equal(byparrPosts, 1, scenario.name);
+        assert.equal(targetGets, 1, scenario.name);
+        assert.equal(urlCache.getStats().size, 0, scenario.name);
+      } finally {
+        await byparr.close();
+        await flare.close();
+        await target.close();
+      }
+    }
+    envManager.restore();
+    urlCache.clear();
+  }, results);
+
+  await testFunction('solver-service retry delay allows Byparr and caches only the winning provider', async () => {
+    urlCache.clear();
+    let targetHeadCount = 0;
+    let targetGetCount = 0;
+    let receivedUserAgent = '';
+    let receivedCookie = '';
+    const target = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        targetHeadCount++;
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end();
+        return;
+      }
+      targetGetCount++;
+      receivedUserAgent = req.headers['user-agent'] ?? '';
+      receivedCookie = req.headers.cookie ?? '';
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<html><body><h1>Byparr winner</h1></body></html>');
+    });
+    let flarePosts = 0;
+    const flare = await startHttpServer((_req, res) => {
+      flarePosts++;
+      res.writeHead(503, { 'retry-after': '60' });
+      res.end();
+    });
+    let byparrPosts = 0;
+    const byparr = await startHttpServer((req, res) => {
+      byparrPosts++;
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        const request = JSON.parse(body) as { url: string };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'ok',
+          solution: {
+            url: request.url,
+            status: 200,
+            cookies: [{ name: 'cf_clearance', value: 'byparr-cookie', domain: '127.0.0.1', path: '/' }],
+            userAgent: 'byparr-winner-agent',
+          },
+        }));
+      });
+    });
+
+    try {
+      envManager.set('FLARESOLVERR_URL', flare.url);
+      envManager.set('BYPARR_URL', byparr.url);
+      envManager.set('NO_PROXY', '127.0.0.1');
+      const first = await fetchAndConvertToMarkdown(createMockServer() as any, target.url);
+      const second = await fetchAndConvertToMarkdown(createMockServer() as any, target.url);
+
+      assert.ok(first.includes('# Byparr winner'));
+      assert.equal(second, first);
+      assert.equal(flarePosts, 1);
+      assert.equal(byparrPosts, 1);
+      assert.equal(targetHeadCount, 1);
+      assert.equal(targetGetCount, 1);
+      assert.equal(receivedUserAgent, 'byparr-winner-agent');
+      assert.equal(receivedCookie, 'cf_clearance=byparr-cookie');
+      assert.equal(
+        urlCache.get(createBrowserSolverCacheKey('flaresolverr', target.url)),
+        null,
+      );
+      assert.notEqual(
+        urlCache.get(createBrowserSolverCacheKey('byparr', target.url)),
+        null,
+      );
+    } finally {
+      envManager.restore();
+      urlCache.clear();
+      await byparr.close();
+      await flare.close();
+      await target.close();
+    }
+  }, results);
+
+  await testFunction('cancellation discards a partial solver-backed body and writes no cache entry', async () => {
+    urlCache.clear();
+    let targetGetCount = 0;
+    const target = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end();
+        return;
+      }
+      targetGetCount++;
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.write('<html><body><h1>partial');
+    });
+    const solver = await startHttpServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        const request = JSON.parse(body) as { url: string };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'ok',
+          solution: {
+            url: request.url,
+            status: 200,
+            cookies: [],
+            userAgent: 'solver-agent',
+          },
+        }));
+      });
+    });
+    const controller = new AbortController();
+
+    try {
+      envManager.set('FLARESOLVERR_URL', solver.url);
+      envManager.set('NO_PROXY', '127.0.0.1');
+      const pending = fetchAndConvertToMarkdown(
+        createMockServer() as any,
+        target.url,
+        10_000,
+        {},
+        controller.signal,
+      );
+      while (targetGetCount < 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      controller.abort(new DOMException('cancelled body', 'AbortError'));
+      await assert.rejects(pending, /cancelled body/u);
+      assert.equal(urlCache.getStats().size, 0);
+    } finally {
+      envManager.restore();
+      urlCache.clear();
+      await solver.close();
+      await target.close();
+    }
+  }, results);
+
+  await testFunction('solver cache entries are isolated from direct URL cache entries', async () => {
+    urlCache.clear();
+    let targetBody = '<html><body><h1>Direct version</h1></body></html>';
+    const target = await startHttpServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(req.method === 'HEAD' ? '' : targetBody);
+    });
+    let solverPostCount = 0;
+    const solver = await startHttpServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => {
+        body += chunk;
+      });
+      req.on('end', () => {
+        solverPostCount++;
+        const request = JSON.parse(body) as { url: string };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'ok',
+          solution: {
+            url: request.url,
+            status: 200,
+            cookies: [],
+            userAgent: 'solver-agent',
+          },
+        }));
+      });
+    });
+
+    try {
+      envManager.delete('FLARESOLVERR_URL');
+      envManager.set('NO_PROXY', '127.0.0.1');
+      const direct = await fetchAndConvertToMarkdown(createMockServer() as any, target.url);
+      assert.ok(direct.includes('# Direct version'));
+
+      targetBody = '<html><body><h1>Solver version</h1></body></html>';
+      envManager.set('FLARESOLVERR_URL', solver.url);
+      const solved = await fetchAndConvertToMarkdown(createMockServer() as any, target.url);
+      const cachedSolved = await fetchAndConvertToMarkdown(createMockServer() as any, target.url);
+
+      assert.ok(solved.includes('# Solver version'));
+      assert.equal(cachedSolved, solved);
+      assert.equal(solverPostCount, 1);
+    } finally {
+      envManager.restore();
+      urlCache.clear();
+      await solver.close();
+      await target.close();
+    }
+  }, results);
+
+  await testFunction('persistent non-success solver status is surfaced without a direct replay', async () => {
+    urlCache.clear();
+    let targetGetCount = 0;
+    const target = await startHttpServer((req, res) => {
+      if (req.method === 'GET') {
+        targetGetCount++;
+      }
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end();
+    });
+    const solver = await startHttpServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        solution: {
+          url: target.url,
+          status: 404,
+          cookies: [],
+          userAgent: 'solver-agent',
+        },
+      }));
+    });
+    let byparrPostCount = 0;
+    const byparr = await startHttpServer((_req, res) => {
+      byparrPostCount++;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end();
+    });
+
+    try {
+      envManager.set('FLARESOLVERR_URL', solver.url);
+      envManager.set('BYPARR_URL', byparr.url);
+      envManager.set('NO_PROXY', '127.0.0.1');
+      await assert.rejects(
+        fetchAndConvertToMarkdown(createMockServer() as any, target.url),
+        /404/u,
+      );
+      assert.equal(targetGetCount, 0);
+      assert.equal(byparrPostCount, 0);
+    } finally {
+      envManager.restore();
+      urlCache.clear();
+      await byparr.close();
+      await solver.close();
+      await target.close();
+    }
+  }, results);
+
+  await testFunction('hostname-divergent solver solutions fail closed before replay', async () => {
+    urlCache.clear();
+    let targetGetCount = 0;
+    const target = await startHttpServer((req, res) => {
+      if (req.method === 'GET') {
+        targetGetCount++;
+      }
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end();
+    });
+    const targetPort = new URL(target.url).port;
+    const solver = await startHttpServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        solution: {
+          url: `http://localhost:${targetPort}/`,
+          status: 200,
+          cookies: [],
+          userAgent: 'solver-agent',
+        },
+      }));
+    });
+    let byparrPostCount = 0;
+    const byparr = await startHttpServer((_req, res) => {
+      byparrPostCount++;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end();
+    });
+
+    try {
+      envManager.set('FLARESOLVERR_URL', solver.url);
+      envManager.set('BYPARR_URL', byparr.url);
+      envManager.set('NO_PROXY', '127.0.0.1,localhost');
+      await assert.rejects(
+        fetchAndConvertToMarkdown(createMockServer() as any, target.url),
+        /different or unsupported hostname/iu,
+      );
+      assert.equal(targetGetCount, 0);
+      assert.equal(byparrPostCount, 0);
+    } finally {
+      envManager.restore();
+      urlCache.clear();
+      await byparr.close();
+      await solver.close();
+      await target.close();
+    }
+  }, results);
+
+  await testFunction('URL security policy blocks a target before contacting FlareSolverr', async () => {
+    urlCache.clear();
+    let solverPostCount = 0;
+    const target = await startTestServer();
+    const solver = await startHttpServer((_req, res) => {
+      solverPostCount++;
+      res.writeHead(500);
+      res.end();
+    });
+
+    try {
+      envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+      envManager.set('FLARESOLVERR_URL', solver.url);
+      envManager.set('NO_PROXY', '127.0.0.1');
+      await assert.rejects(
+        fetchAndConvertToMarkdown(createMockServer() as any, target.url),
+        /not allowed|security/iu,
+      );
+      assert.equal(solverPostCount, 0);
+    } finally {
+      envManager.restore();
+      urlCache.clear();
+      await solver.close();
+      await target.close();
+    }
+  }, results);
+
+  await testFunction('oversized target HEAD response is rejected before contacting FlareSolverr', async () => {
+    urlCache.clear();
+    let targetGetCount = 0;
+    const target = await startHttpServer((req, res) => {
+      if (req.method === 'GET') {
+        targetGetCount++;
+      }
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-length': '100',
+      });
+      res.end();
+    });
+    let solverPostCount = 0;
+    const solver = await startHttpServer((_req, res) => {
+      solverPostCount++;
+      res.writeHead(500);
+      res.end();
+    });
+
+    try {
+      envManager.set('FLARESOLVERR_URL', solver.url);
+      envManager.set('URL_READ_MAX_CONTENT_LENGTH_BYTES', '8');
+      envManager.set('NO_PROXY', '127.0.0.1');
+      const result = await fetchAndConvertToMarkdown(createMockServer() as any, target.url);
+
+      assert.ok(result.includes('Content too large'));
+      assert.equal(solverPostCount, 0);
+      assert.equal(targetGetCount, 0);
+    } finally {
+      envManager.restore();
+      urlCache.clear();
+      await solver.close();
+      await target.close();
+    }
+  }, results);
 
   await testFunction('Network error handling', async () => {
     const mockServer = createMockServer();
@@ -240,6 +1068,52 @@ async function runTests() {
       );
     } finally {
       await close();
+    }
+  }, results);
+
+  await testFunction('SEARCH_USER_AGENT does not override USER_AGENT for URL reads', async () => {
+    envManager.set('SEARCH_USER_AGENT', 'SearchBot/2.0');
+    envManager.set('USER_AGENT', 'GlobalBot/1.0');
+    envManager.delete('URL_READER_USER_AGENT');
+    const mockServer = createMockServer();
+    const seenUserAgents: string[] = [];
+    const { url, close } = await startHttpServer((req, res) => {
+      seenUserAgents.push(req.headers['user-agent'] ?? '');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<html><body><h1>Readable</h1></body></html>');
+    });
+
+    try {
+      await fetchAndConvertToMarkdown(mockServer as any, url);
+
+      assert.ok(seenUserAgents.length > 0, 'Expected the URL reader to make a request');
+      assert.ok(seenUserAgents.every((userAgent) => userAgent === 'GlobalBot/1.0'));
+    } finally {
+      await close();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('URL_READER_USER_AGENT still overrides USER_AGENT when SEARCH_USER_AGENT is set', async () => {
+    envManager.set('SEARCH_USER_AGENT', 'SearchBot/2.0');
+    envManager.set('USER_AGENT', 'GlobalBot/1.0');
+    envManager.set('URL_READER_USER_AGENT', 'ReaderBot/3.0');
+    const mockServer = createMockServer();
+    const seenUserAgents: string[] = [];
+    const { url, close } = await startHttpServer((req, res) => {
+      seenUserAgents.push(req.headers['user-agent'] ?? '');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<html><body><h1>Readable</h1></body></html>');
+    });
+
+    try {
+      await fetchAndConvertToMarkdown(mockServer as any, url);
+
+      assert.ok(seenUserAgents.length > 0, 'Expected the URL reader to make a request');
+      assert.ok(seenUserAgents.every((userAgent) => userAgent === 'ReaderBot/3.0'));
+    } finally {
+      await close();
+      envManager.restore();
     }
   }, results);
 
@@ -314,7 +1188,13 @@ async function runTests() {
     try {
       const result = await fetchAndConvertToMarkdown(mockServer as any, url);
       assert.ok(result.includes('Content too large'));
-      assert.ok(result.includes('0.0 MB'));
+      // Small sizes render as exact bytes, not a misleading "0.00 MB".
+      assert.ok(result.includes('101 bytes'), `Expected exact byte count, got: ${result}`);
+      assert.ok(result.includes('100 bytes'), `Expected exact limit in bytes, got: ${result}`);
+      // Message must state readHeadings/section cannot bypass the cap...
+      assert.ok(result.includes('cannot fetch a page over the size cap'), `Expected disclaimer, got: ${result}`);
+      // ...and name the env var that actually raises the limit.
+      assert.ok(result.includes('URL_READ_MAX_CONTENT_LENGTH_BYTES'), `Expected env var hint, got: ${result}`);
       assert.deepEqual(seenMethods, ['HEAD']);
     } finally {
       await close();
@@ -351,6 +1231,194 @@ async function runTests() {
     }
   }, results);
 
+  await testFunction('Streaming GET body without Content-Length is capped', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    envManager.set('URL_READ_MAX_CONTENT_LENGTH_BYTES', '64');
+
+    const seenMethods: string[] = [];
+    const { url, close } = await startHttpServer((req, res) => {
+      seenMethods.push(req.method || 'UNKNOWN');
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.write('<html><body><h1>Chunked</h1>');
+      res.write('x'.repeat(128));
+      res.end('</body></html>');
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.includes('Content too large'), `Expected content-too-large message, got: ${result}`);
+      assert.deepEqual(seenMethods, ['HEAD', 'GET']);
+    } finally {
+      await close();
+      envManager.restore();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Streaming GET body with understated HEAD Content-Length is capped', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    envManager.set('URL_READ_MAX_CONTENT_LENGTH_BYTES', '64');
+
+    const seenMethods: string[] = [];
+    const { url, close } = await startHttpServer((req, res) => {
+      seenMethods.push(req.method || 'UNKNOWN');
+      if (req.method === 'HEAD') {
+        res.writeHead(200, { 'content-length': '10' });
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.write('<html><body><h1>Understated</h1>');
+      res.write('x'.repeat(128));
+      res.end('</body></html>');
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.includes('Content too large'), `Expected content-too-large message, got: ${result}`);
+      assert.deepEqual(seenMethods, ['HEAD', 'GET']);
+    } finally {
+      await close();
+      envManager.restore();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Streaming GET body just under limit is returned in full', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    envManager.set('URL_READ_MAX_CONTENT_LENGTH_BYTES', '128');
+
+    const html = '<html><body><h1>Within Limit</h1><p>Complete body.</p></body></html>';
+    const { url, close } = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end(html);
+    });
+
+    try {
+      assert.ok(Buffer.byteLength(html, 'utf8') < 128, 'Test body must stay below configured cap');
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.includes('Within Limit'), `Expected converted content, got: ${result}`);
+      assert.ok(result.includes('Complete body'), `Expected complete converted body, got: ${result}`);
+    } finally {
+      await close();
+      envManager.restore();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Over-limit streaming GET result is not cached', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    envManager.set('URL_READ_MAX_CONTENT_LENGTH_BYTES', '64');
+
+    let headCount = 0;
+    let getCount = 0;
+    const { url, close } = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        headCount++;
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      getCount++;
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.write('<html><body><h1>Not cached</h1>');
+      res.write('x'.repeat(128));
+      res.end('</body></html>');
+    });
+
+    try {
+      const first = await fetchAndConvertToMarkdown(mockServer as any, url);
+      const second = await fetchAndConvertToMarkdown(mockServer as any, url);
+
+      assert.ok(first.includes('Content too large'), `Expected first read to be capped, got: ${first}`);
+      assert.ok(second.includes('Content too large'), `Expected second read to be capped, got: ${second}`);
+      assert.equal(headCount, 2, 'Second over-limit read should repeat HEAD instead of using cache');
+      assert.equal(getCount, 2, 'Second over-limit read should re-fetch instead of using cache');
+    } finally {
+      await close();
+      envManager.restore();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Oversized HTTP error response body is capped', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    envManager.set('URL_READ_MAX_CONTENT_LENGTH_BYTES', '64');
+
+    let chunksWritten = 0;
+    let responseClosed = false;
+    let resolveResponseClosed: () => void = () => {};
+    const responseClosedPromise = new Promise<void>((resolve) => {
+      resolveResponseClosed = resolve;
+    });
+    const totalChunks = 100;
+    const { url, close } = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        res.writeHead(500);
+        res.end();
+        return;
+      }
+
+      res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+      res.on('close', () => {
+        responseClosed = true;
+        resolveResponseClosed();
+      });
+
+      const writeNext = () => {
+        if (res.destroyed || chunksWritten >= totalChunks) {
+          res.end();
+          return;
+        }
+
+        chunksWritten++;
+        res.write('x'.repeat(32));
+        setImmediate(writeNext);
+      };
+
+      writeNext();
+    });
+
+    try {
+      await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.fail('Expected server error');
+    } catch (error: any) {
+      assert.ok(
+        error.message.includes('Website Error (500)') || error.name === 'MCPSearXNGError',
+        `Expected server error, got: ${error.message}`,
+      );
+      await Promise.race([
+        responseClosedPromise,
+        new Promise<void>((resolve) => setTimeout(resolve, 50)),
+      ]);
+      assert.ok(responseClosed, 'Expected response stream to be closed');
+      assert.ok(chunksWritten < totalChunks, `Expected capped error-body read, wrote all ${chunksWritten} chunks`);
+    } finally {
+      await close();
+      envManager.restore();
+      urlCache.clear();
+    }
+  }, results);
+
   await testFunction('Invalid URL_READ_MAX_CONTENT_LENGTH_BYTES falls back to default cap', async () => {
     const mockServer = createMockServer();
     urlCache.clear();
@@ -372,6 +1440,42 @@ async function runTests() {
       const result = await fetchAndConvertToMarkdown(mockServer as any, url);
       assert.ok(result.includes('Content too large'));
       assert.deepEqual(seenMethods, ['HEAD']);
+    } finally {
+      await close();
+      envManager.restore();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('URL_READ_MAX_CONTENT_LENGTH_BYTES rejects a numeric prefix with a suffix', async () => {
+    const { server: mockServer, getLoggingCalls } = createMockServerWithTracking();
+    urlCache.clear();
+    envManager.set('URL_READ_MAX_CONTENT_LENGTH_BYTES', '5MB');
+
+    const seenMethods: string[] = [];
+    const { url, close } = await startHttpServer((req, res) => {
+      seenMethods.push(req.method || 'UNKNOWN');
+      if (req.method === 'HEAD') {
+        res.writeHead(200, { 'content-length': '6' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<html><body><h1>Readable Content</h1></body></html>');
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.includes('Readable Content'), `Expected default limit to allow the read, got: ${result}`);
+      assert.deepEqual(seenMethods, ['HEAD', 'GET']);
+      assert.ok(
+        getLoggingCalls().some((entry: any) =>
+          entry.level === 'warning'
+          && entry.data?.message?.includes(
+            'Ignoring invalid URL_READ_MAX_CONTENT_LENGTH_BYTES="5MB"',
+          )),
+        `Expected invalid-value warning, got: ${JSON.stringify(getLoggingCalls())}`,
+      );
     } finally {
       await close();
       envManager.restore();
@@ -478,6 +1582,599 @@ async function runTests() {
       assert.ok(result.includes('Main Title') || result.includes('#'));
     } finally {
       await close();
+    }
+  }, results);
+
+  await testFunction('HTML without Content-Type still uses HTML to Markdown conversion', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const testHtml = '<html><body><h1>No Type Title</h1><p>This is <strong>HTML</strong>.</p></body></html>';
+    const { url, close } = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200);
+      res.end(testHtml);
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.equal(result, '# No Type Title\n\nThis is **HTML**.');
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Generic non-NUL content still uses HTML to Markdown conversion', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const testHtml = '<html><body><h1>Generic Type Title</h1><p>Still HTML.</p></body></html>';
+    const { url, close } = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'application/x-custom' });
+      res.end(testHtml);
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.equal(result, '# Generic Type Title\n\nStill HTML.');
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('XHTML content uses HTML to Markdown conversion', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const testHtml = '<html><body><h1>XHTML Title</h1><p>Readable page.</p></body></html>';
+    const { url, close } = await startTestServer({
+      headers: { 'content-type': 'application/xhtml+xml; charset=utf-8' },
+      body: testHtml,
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.equal(result, '# XHTML Title\n\nReadable page.');
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('JSON content is pretty-printed in a fenced block', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const { url, close } = await startTestServer({
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      body: '{"name":"searxng","enabled":true,"items":[1,2]}',
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.equal(result, '```json\n{\n  "name": "searxng",\n  "enabled": true,\n  "items": [\n    1,\n    2\n  ]\n}\n```');
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Problem JSON content is pretty-printed in a fenced block', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const { url, close } = await startTestServer({
+      headers: { 'content-type': 'application/problem+json' },
+      body: '{"type":"about:blank","title":"Bad Request","status":400}',
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.equal(result, '```json\n{\n  "type": "about:blank",\n  "title": "Bad Request",\n  "status": 400\n}\n```');
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Invalid JSON content-type returns fenced text with a note', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const { url, close } = await startTestServer({
+      headers: { 'content-type': 'application/json' },
+      body: '{"name":',
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.startsWith('Note: Response declared JSON but could not be parsed.'));
+      assert.ok(result.includes('```text\n{"name":\n```'), `Expected fenced text, got: ${result}`);
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Readable fenced content uses a longer fence when the body contains backticks', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const body = 'before ``` after';
+    const { url, close } = await startTestServer({
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+      body,
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.startsWith('````text\n'), `Expected four-backtick opening fence, got: ${result}`);
+      assert.ok(result.endsWith('\n````'), `Expected four-backtick closing fence, got: ${result}`);
+      assert.ok(result.includes(body), `Expected original backticks preserved, got: ${result}`);
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Plain text, YAML, TOML, and XML content return fenced readable text', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const cases = [
+      {
+        contentType: 'text/plain; charset=utf-8',
+        body: 'plain text\nsecond line',
+        expected: '```text\nplain text\nsecond line\n```',
+      },
+      {
+        contentType: 'application/yaml',
+        body: 'name: searxng\nenabled: true',
+        expected: '```yaml\nname: searxng\nenabled: true\n```',
+      },
+      {
+        contentType: 'application/toml',
+        body: 'name = "searxng"\nenabled = true',
+        expected: '```toml\nname = "searxng"\nenabled = true\n```',
+      },
+      {
+        contentType: 'application/xml',
+        body: '<root><name>searxng</name></root>',
+        expected: '```xml\n<root><name>searxng</name></root>\n```',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const { url, close } = await startTestServer({
+        headers: { 'content-type': testCase.contentType },
+        body: testCase.body,
+      });
+
+      try {
+        const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+        assert.equal(result, testCase.expected);
+      } finally {
+        await close();
+        urlCache.clear();
+      }
+    }
+  }, results);
+
+  await testFunction('Explicit text content with NUL byte in prefix returns binary hint', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const { url, close } = await startTestServer({
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+      body: Buffer.from([0x74, 0x65, 0x78, 0x74, 0x00, 0x01, 0x02]),
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.includes('declared text/plain'), `Expected declared content type in hint, got: ${result}`);
+      assert.ok(result.includes('appears binary'), `Expected binary explanation, got: ${result}`);
+      assert.ok(!result.includes('```text'), `Expected binary hint, not fenced text, got: ${result}`);
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Explicit binary, archive, image, and video content-types return unsupported hints', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const cases = [
+      'application/zip',
+      'image/png',
+      'video/mp4',
+      'application/octet-stream',
+    ];
+
+    for (const contentType of cases) {
+      const { url, close } = await startTestServer({
+        headers: { 'content-type': contentType },
+        body: Buffer.from([0, 1, 2, 3, 4, 5]),
+      });
+
+      try {
+        const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+        assert.ok(result.includes('Unsupported content type'), `Expected unsupported hint for ${contentType}, got: ${result}`);
+        assert.ok(result.includes(contentType), `Expected content type in hint, got: ${result}`);
+        assert.ok(!result.includes('\u0000'), `Hint must not include raw binary bytes: ${result}`);
+      } finally {
+        await close();
+        urlCache.clear();
+      }
+    }
+  }, results);
+
+  await testFunction('Explicit binary content-type cancels before full body download', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    let chunksWritten = 0;
+    let responseClosed = false;
+    let resolveResponseClosed: () => void = () => {};
+    const responseClosedPromise = new Promise<void>((resolve) => {
+      resolveResponseClosed = resolve;
+    });
+    const totalChunks = 100;
+
+    const { url, close } = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'application/zip' });
+      res.on('close', () => {
+        responseClosed = true;
+        resolveResponseClosed();
+      });
+
+      const writeNext = () => {
+        if (res.destroyed || chunksWritten >= totalChunks) {
+          res.end();
+          return;
+        }
+
+        chunksWritten++;
+        res.write(Buffer.alloc(32, chunksWritten));
+        setImmediate(writeNext);
+      };
+
+      writeNext();
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.includes('Unsupported content type'), `Expected unsupported hint, got: ${result}`);
+      await Promise.race([
+        responseClosedPromise,
+        new Promise<void>((resolve) => setTimeout(resolve, 100)),
+      ]);
+      assert.ok(responseClosed, 'Expected response stream to be closed');
+      assert.ok(chunksWritten < totalChunks, `Expected early cancellation before ${totalChunks} chunks, wrote ${chunksWritten}`);
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('application/pdf responses return extracted text and use the normal cache and pagination', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    let requestCount = 0;
+    const pdf = Buffer.from(createTextPdf(['Encrypted Matrix-Vector Products', 'Abstract test content']));
+    const { url, close } = await startHttpServer((req, res) => {
+      requestCount++;
+      res.writeHead(200, { 'content-type': 'application/pdf' });
+      res.end(req.method === 'HEAD' ? undefined : pdf);
+    });
+
+    try {
+      const first = await fetchAndConvertToMarkdown(mockServer as any, url, 10000, { maxLength: 32 });
+      const second = await fetchAndConvertToMarkdown(mockServer as any, url, 10000, { startChar: 0 });
+      assert.equal(first.length, 32);
+      assert.ok(first.startsWith('```text\nEncrypted Matrix-'));
+      assert.ok(second.includes('Encrypted Matrix-Vector Products'));
+      assert.ok(second.includes('Abstract test content'));
+      assert.ok(second.startsWith('```text\n'));
+      assert.ok(second.endsWith('\n```'));
+      assert.equal(requestCount, 2, 'Successful PDF text should be cached after one HEAD and GET');
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('application/pdf enforces both configured and fixed input byte ceilings', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    const limits = [
+      {
+        configured: '64',
+        bodyBytes: 65,
+        expectedLimit: '64 bytes',
+        expectedHint: 'raise URL_READ_MAX_CONTENT_LENGTH_BYTES',
+      },
+      {
+        configured: String(20 * 1024 * 1024),
+        bodyBytes: 16 * 1024 * 1024 + 1,
+        expectedLimit: '16.00 MB (16777216 bytes)',
+        expectedHint: 'fixed PDF input ceiling',
+      },
+    ];
+
+    for (const limit of limits) {
+      envManager.set('URL_READ_MAX_CONTENT_LENGTH_BYTES', limit.configured);
+      const body = Buffer.alloc(limit.bodyBytes);
+      body.write('%PDF-', 0, 'ascii');
+      const { url, close } = await startHttpServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'application/pdf' });
+        res.end(req.method === 'HEAD' ? undefined : body);
+      });
+      try {
+        const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+        assert.ok(result.startsWith('Content too large:'), result);
+        assert.ok(result.includes(limit.expectedLimit), result);
+        assert.ok(result.includes(limit.expectedHint), result);
+        if (limit.expectedHint === 'fixed PDF input ceiling') {
+          assert.ok(!result.includes('raise URL_READ_MAX_CONTENT_LENGTH_BYTES'), result);
+        }
+      } finally {
+        await close();
+        urlCache.clear();
+      }
+    }
+  }, results);
+
+  await testFunction('application/pdf rejects a mismatched signature without starting a parser', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    const { url, close } = await startTestServer({
+      headers: { 'content-type': 'application/pdf' },
+      body: 'not a pdf',
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.equal(result, 'Response declared application/pdf but did not contain a PDF document.');
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('application/pdf body timeouts preserve the standard timeout error', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    const { url, close } = await startHttpServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/pdf' });
+      if (req.method === 'HEAD') {
+        res.end();
+        return;
+      }
+      res.write('%PDF-');
+    });
+
+    try {
+      await assert.rejects(
+        fetchAndConvertToMarkdown(mockServer as any, url, 100),
+        (error: any) => error.message.includes('Timeout Error'),
+      );
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('application/pdf reports malformed and no-text documents without caching them', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    const cases = [
+      {
+        body: Buffer.from('%PDF-not-valid'),
+        expected: 'Unable to extract text from PDF.',
+      },
+      {
+        body: Buffer.from(createTextPdf([''])),
+        expected: 'No extractable text (likely a scanned/image PDF; OCR is not supported).',
+      },
+      {
+        body: Buffer.from(createTextPdf(Array.from({ length: 501 }, () => ''))),
+        expected: 'PDF has too many pages to extract safely (observed: 501; limit: 500).',
+      },
+    ];
+
+    for (const testCase of cases) {
+      let requestCount = 0;
+      const { url, close } = await startHttpServer((req, res) => {
+        requestCount++;
+        res.writeHead(200, { 'content-type': 'application/pdf' });
+        res.end(req.method === 'HEAD' ? undefined : testCase.body);
+      });
+      try {
+        assert.equal(await fetchAndConvertToMarkdown(mockServer as any, url), testCase.expected);
+        assert.equal(await fetchAndConvertToMarkdown(mockServer as any, url), testCase.expected);
+        assert.equal(requestCount, 4, 'Failed PDF extraction must not be cached');
+      } finally {
+        await close();
+        urlCache.clear();
+      }
+    }
+  }, results);
+
+  await testFunction('Explicit text content with early NUL cancels before full body download', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    let chunksWritten = 0;
+    let responseClosed = false;
+    let resolveResponseClosed: () => void = () => {};
+    const responseClosedPromise = new Promise<void>((resolve) => {
+      resolveResponseClosed = resolve;
+    });
+    const totalChunks = 100;
+
+    const { url, close } = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.on('close', () => {
+        responseClosed = true;
+        resolveResponseClosed();
+      });
+
+      const writeNext = () => {
+        if (res.destroyed || chunksWritten >= totalChunks) {
+          res.end();
+          return;
+        }
+
+        chunksWritten++;
+        const chunk = chunksWritten === 1
+          ? Buffer.from([0x74, 0x65, 0x78, 0x74, 0x00])
+          : Buffer.alloc(32, chunksWritten);
+        res.write(chunk);
+        setImmediate(writeNext);
+      };
+
+      writeNext();
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.includes('declared text/plain'), `Expected declared content type in hint, got: ${result}`);
+      assert.ok(result.includes('appears binary'), `Expected binary explanation, got: ${result}`);
+      await Promise.race([
+        responseClosedPromise,
+        new Promise<void>((resolve) => setTimeout(resolve, 100)),
+      ]);
+      assert.ok(responseClosed, 'Expected response stream to be closed');
+      assert.ok(chunksWritten < totalChunks, `Expected early cancellation before ${totalChunks} chunks, wrote ${chunksWritten}`);
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Missing Content-Type with NUL byte in prefix returns unsupported hint', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    const { url, close } = await startHttpServer((req, res) => {
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200);
+      res.end(Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00, 0x01, 0x02]));
+    });
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, url);
+      assert.ok(result.includes('Unsupported content type'), `Expected unsupported hint, got: ${result}`);
+      assert.ok(result.includes('binary'), `Expected binary explanation, got: ${result}`);
+    } finally {
+      await close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Successful JSON and text reads are cached', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    let jsonRequestCount = 0;
+    const jsonServer = await startHttpServer((req, res) => {
+      jsonRequestCount++;
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"cached":true}');
+    });
+
+    let textRequestCount = 0;
+    const textServer = await startHttpServer((req, res) => {
+      textRequestCount++;
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('cached text');
+    });
+
+    try {
+      await fetchAndConvertToMarkdown(mockServer as any, jsonServer.url);
+      await fetchAndConvertToMarkdown(mockServer as any, jsonServer.url);
+      await fetchAndConvertToMarkdown(mockServer as any, textServer.url);
+      await fetchAndConvertToMarkdown(mockServer as any, textServer.url);
+
+      assert.equal(jsonRequestCount, 2, 'Second JSON read should use cache');
+      assert.equal(textRequestCount, 2, 'Second text read should use cache');
+    } finally {
+      await jsonServer.close();
+      await textServer.close();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('Binary-rejected URLs are not cached', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+
+    let requestCount = 0;
+    const { url, close } = await startHttpServer((req, res) => {
+      requestCount++;
+      if (req.method === 'HEAD') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      res.writeHead(200, { 'content-type': 'application/zip' });
+      res.end(Buffer.from([0, 1, 2, 3]));
+    });
+
+    try {
+      const first = await fetchAndConvertToMarkdown(mockServer as any, url);
+      const second = await fetchAndConvertToMarkdown(mockServer as any, url);
+
+      assert.ok(first.includes('Unsupported content type'));
+      assert.ok(second.includes('Unsupported content type'));
+      assert.equal(requestCount, 4, 'Second binary-rejected read should re-fetch instead of using cache');
+    } finally {
+      await close();
+      urlCache.clear();
     }
   }, results);
 
@@ -604,6 +2301,7 @@ async function runTests() {
       'http://127.0.0.1:1/private',
       'http://localhost:1/private',
       'http://10.0.0.1/private',
+      'http://[::ffff:0:127.0.0.1]:1/private',
     ];
 
     try {
@@ -619,6 +2317,343 @@ async function runTests() {
         }
       }
     } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('default mode blocks native non-global IPv6 literals before proxy dispatch', async () => {
+    const mockServer = createMockServer();
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+
+    let deniedTargetDispatches = 0;
+    const proxy = await startConnectProxyServer(() => {
+      deniedTargetDispatches++;
+      return { body: '<html><body><h1>Denied target</h1></body></html>' };
+    });
+    envManager.set('URL_READER_HTTP_PROXY', proxy.url);
+    envManager.delete('NO_PROXY');
+
+    try {
+      for (const literal of ['http://[fec0::1]:12345/private', 'http://[ff0e::1]:12345/private']) {
+        try {
+          await fetchAndConvertToMarkdown(mockServer as any, literal, 250);
+          assert.fail(`Expected native non-global IPv6 literal to be blocked: ${literal}`);
+        } catch (error: any) {
+          assert.ok(error.message.includes('blocked by security policy'));
+        }
+      }
+      assert.equal(deniedTargetDispatches, 0, 'Denied literal targets must not be dispatched');
+    } finally {
+      await proxy.close();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('default mode blocks hostnames resolving to private IPv4 ranges', async () => {
+    const mockServer = createMockServer();
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+    envManager.delete('HTTP_PROXY');
+    envManager.delete('HTTPS_PROXY');
+    envManager.delete('http_proxy');
+    envManager.delete('https_proxy');
+    envManager.delete('URL_READER_HTTP_PROXY');
+    envManager.delete('URL_READER_HTTPS_PROXY');
+    envManager.delete('url_reader_http_proxy');
+    envManager.delete('url_reader_https_proxy');
+
+    const privateCases: MockDnsRecords = {
+      'loopback.example': [{ address: '127.0.0.1', family: 4 }],
+      'ten.example': [{ address: '10.0.0.5', family: 4 }],
+      'lan.example': [{ address: '192.168.1.20', family: 4 }],
+      'rfc1918.example': [{ address: '172.16.0.9', family: 4 }],
+      'metadata.example': [{ address: '169.254.169.254', family: 4 }],
+      'cgnat.example': [{ address: '100.64.0.1', family: 4 }],
+    };
+    const restoreDns = installDnsLookupMock(privateCases);
+
+    try {
+      for (const hostname of Object.keys(privateCases)) {
+        try {
+          await fetchAndConvertToMarkdown(mockServer as any, `http://${hostname}/private`, 250);
+          assert.fail(`Expected hostname resolving to private IP to be blocked: ${hostname}`);
+        } catch (error: any) {
+          assert.ok(
+            error.message.includes('blocked by security policy'),
+            `Expected security policy error for ${hostname}, got: ${error.message}`,
+          );
+        }
+      }
+    } finally {
+      restoreDns();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('default mode blocks hostnames resolving to private IPv6 ranges', async () => {
+    const mockServer = createMockServer();
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+    envManager.delete('HTTP_PROXY');
+    envManager.delete('HTTPS_PROXY');
+    envManager.delete('http_proxy');
+    envManager.delete('https_proxy');
+    envManager.delete('URL_READER_HTTP_PROXY');
+    envManager.delete('URL_READER_HTTPS_PROXY');
+    envManager.delete('url_reader_http_proxy');
+    envManager.delete('url_reader_https_proxy');
+
+    const privateCases: MockDnsRecords = {
+      'v6-loopback.example': [{ address: '::1', family: 6 }],
+      'v6-ula.example': [{ address: 'fc00::1', family: 6 }],
+      'v6-linklocal.example': [{ address: 'fe80::1', family: 6 }],
+      'v6-site-local.example': [{ address: 'FEC0::1', family: 6 }],
+      'v6-multicast.example': [{ address: 'ff0e::1', family: 6 }],
+      'v6-translated.example': [{ address: '::ffff:0:127.0.0.1', family: 6 }],
+    };
+    const restoreDns = installDnsLookupMock(privateCases);
+
+    try {
+      for (const hostname of Object.keys(privateCases)) {
+        try {
+          await fetchAndConvertToMarkdown(mockServer as any, `http://${hostname}/private`, 250);
+          assert.fail(`Expected hostname resolving to private IPv6 to be blocked: ${hostname}`);
+        } catch (error: any) {
+          assert.ok(
+            error.message.includes('blocked by security policy'),
+            `Expected security policy error for ${hostname}, got: ${error.message}`,
+          );
+        }
+      }
+    } finally {
+      restoreDns();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('default mode pins the first resolver-ordered public answer without relookup', async () => {
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+
+    let lookupCount = 0;
+    const originalLookup = dnsModule.lookup;
+    (dnsModule as any).lookup = (hostname: string, options: any, callback?: any) => {
+      if (net.isIP(hostname)) {
+        return (originalLookup as any).call(dnsModule, hostname, options, callback);
+      }
+
+      lookupCount++;
+      const cb = typeof options === 'function' ? options : callback;
+      if (options?.all) {
+        cb(null, [
+          { address: TEST_PUBLIC_IP, family: 4 },
+          { address: '1.1.1.1', family: 4 },
+        ]);
+        return;
+      }
+      cb(null, TEST_PUBLIC_IP, 4);
+    };
+    syncBuiltinESMExports();
+    const lookup = createUrlReaderLookup();
+
+    try {
+      const result = await new Promise<{ address: string; family: number }>((resolve, reject) => {
+        lookup('public.example', {}, (error, address, family) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve({ address: address || '', family: family || 0 });
+        });
+      });
+
+      assert.deepEqual(result, { address: TEST_PUBLIC_IP, family: 4 });
+      const allResult = await new Promise<Array<{ address: string; family: number }>>((resolve, reject) => {
+        lookup('public.example', { all: true }, (error, address) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(Array.isArray(address) ? address : []);
+        });
+      });
+
+      assert.deepEqual(allResult, [{ address: TEST_PUBLIC_IP, family: 4 }]);
+      assert.equal(lookupCount, 2, 'Expected exactly one DNS lookup per custom lookup invocation');
+    } finally {
+      (dnsModule as any).lookup = originalLookup;
+      syncBuiltinESMExports();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('default mode blocks rebinding when any DNS answer is private', async () => {
+    const mockServer = createMockServer();
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+    envManager.delete('HTTP_PROXY');
+    envManager.delete('HTTPS_PROXY');
+    envManager.delete('http_proxy');
+    envManager.delete('https_proxy');
+    envManager.delete('URL_READER_HTTP_PROXY');
+    envManager.delete('URL_READER_HTTPS_PROXY');
+    envManager.delete('url_reader_http_proxy');
+    envManager.delete('url_reader_https_proxy');
+
+    const restoreDns = installDnsLookupMock({
+      'mixed.example': [
+        { address: TEST_PUBLIC_IP, family: 4 },
+        { address: '::ffff:0:127.0.0.1', family: 6 },
+      ],
+      'mixed-native-v6.example': [
+        { address: TEST_PUBLIC_IP, family: 4 },
+        { address: 'ff0e::1', family: 6 },
+      ],
+      'mixed-site-local-v6.example': [
+        { address: TEST_PUBLIC_IP, family: 4 },
+        { address: 'fec0::1', family: 6 },
+      ],
+    });
+
+    try {
+      for (const hostname of ['mixed.example', 'mixed-native-v6.example', 'mixed-site-local-v6.example']) {
+        try {
+          await fetchAndConvertToMarkdown(mockServer as any, `http://${hostname}/private`, 250);
+          assert.fail(`Expected hostname with a denied DNS answer to be blocked: ${hostname}`);
+        } catch (error: any) {
+          assert.ok(
+            error.message.includes('blocked by security policy'),
+            `Expected security policy error, got: ${error.message}`,
+          );
+        }
+      }
+    } finally {
+      restoreDns();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('translated DNS answers produce URLSecurityPolicyDnsError while public answers map through', async () => {
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+    const restoreDns = installDnsLookupMock({
+      'translated-dns.example': [{ address: '::ffff:0:127.0.0.1', family: 6 }],
+      'scoped-dns.example': [{ address: 'fe80::1%eth0', family: 6 }],
+      'site-local-dns.example': [{ address: 'fec0::1', family: 6 }],
+      'multicast-dns.example': [{ address: 'ff00::1', family: 6 }],
+      'public-dns.example': [{ address: TEST_PUBLIC_IP, family: 4 }],
+    });
+    const lookup = createUrlReaderLookup();
+
+    try {
+      const blocked = await new Promise<unknown>((resolve) => {
+        lookup('translated-dns.example', {}, (error) => resolve(error));
+      });
+      assert.equal((blocked as Error).name, 'URLSecurityPolicyDnsError');
+      assert.equal(isUrlSecurityPolicyDnsError(blocked), true);
+
+      const scopedBlocked = await new Promise<unknown>((resolve) => {
+        lookup('scoped-dns.example', {}, (error) => resolve(error));
+      });
+      assert.equal((scopedBlocked as Error).name, 'URLSecurityPolicyDnsError');
+      assert.equal(isUrlSecurityPolicyDnsError(scopedBlocked), true);
+
+      for (const hostname of ['site-local-dns.example', 'multicast-dns.example']) {
+        const nativeBlocked = await new Promise<unknown>((resolve) => {
+          lookup(hostname, {}, (error) => resolve(error));
+        });
+        assert.equal((nativeBlocked as Error).name, 'URLSecurityPolicyDnsError');
+        assert.equal(isUrlSecurityPolicyDnsError(nativeBlocked), true);
+      }
+
+      const allowed = await new Promise<{ address: string; family: number }>((resolve, reject) => {
+        lookup('public-dns.example', {}, (error, address, family) => {
+          if (error) return reject(error);
+          resolve({ address: address as string, family: family as number });
+        });
+      });
+      assert.deepEqual(allowed, { address: TEST_PUBLIC_IP, family: 4 });
+    } finally {
+      restoreDns();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('MCP_HTTP_ALLOW_PRIVATE_URLS allows private DNS resolution', async () => {
+    const mockServer = createMockServer();
+    urlCache.clear();
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.set('MCP_HTTP_ALLOW_PRIVATE_URLS', 'true');
+    envManager.delete('HTTP_PROXY');
+    envManager.delete('HTTPS_PROXY');
+    envManager.delete('http_proxy');
+    envManager.delete('https_proxy');
+    envManager.delete('URL_READER_HTTP_PROXY');
+    envManager.delete('URL_READER_HTTPS_PROXY');
+    envManager.delete('url_reader_http_proxy');
+    envManager.delete('url_reader_https_proxy');
+
+    const restoreDns = installDnsLookupMock({
+      'internal.example': [{ address: '127.0.0.1', family: 4 }],
+      'translated-override.example': [{ address: '::ffff:0:127.0.0.1', family: 6 }],
+      'rfc8215-override.example': [{ address: '64:ff9b:1::1', family: 6 }],
+      'site-local-override.example': [{ address: 'fec0::1', family: 6 }],
+      'multicast-override.example': [{ address: 'ff0e::1', family: 6 }],
+    });
+    const { url, close } = await startTestServer({ body: '<html><body><h1>Internal DNS target</h1></body></html>' });
+    const port = new URL(url).port;
+
+    try {
+      const result = await fetchAndConvertToMarkdown(mockServer as any, `http://internal.example:${port}/article`, 1000);
+      assert.ok(result.includes('Internal DNS target'), `Expected private DNS opt-out fetch, got: ${result}`);
+      for (const hostname of [
+        'translated-override.example', 'rfc8215-override.example',
+        'site-local-override.example', 'multicast-override.example',
+      ]) {
+        const allowed = await new Promise<{ address: string; family: number }>((resolve, reject) => {
+          createUrlReaderLookup()(hostname, {}, (error, address, family) => {
+            if (error) return reject(error);
+            resolve({ address: address as string, family: family as number });
+          });
+        });
+        assert.equal(allowed.family, 6, `${hostname} should be allowed by the override`);
+      }
+    } finally {
+      restoreDns();
+      await close();
+      envManager.restore();
+      urlCache.clear();
+    }
+  }, results);
+
+  await testFunction('redirect target resolving to a private IP is blocked', async () => {
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+
+    const restoreDns = installDnsLookupMock({
+      'private-redirect.example': [{ address: '::ffff:0:127.0.0.1', family: 6 }],
+    });
+    const lookup = createUrlReaderLookup();
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        lookup('private-redirect.example', {}, (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      });
+      assert.fail('Expected redirect target resolving to private IP to be blocked');
+    } catch (error: any) {
+      assert.ok(
+        error.name === 'URLSecurityPolicyDnsError',
+        `Expected DNS security policy error, got: ${error.name}: ${error.message}`,
+      );
+    } finally {
+      restoreDns();
       envManager.restore();
     }
   }, results);
@@ -681,6 +2716,44 @@ async function runTests() {
         error.message.includes('blocked by security policy'),
         `Expected security policy error, got: ${error.message}`,
       );
+    } finally {
+      await proxy.close();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('redirects to native non-global IPv6 URLs are blocked before target dispatch', async () => {
+    const mockServer = createMockServer();
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOW_PRIVATE_URLS');
+
+    let deniedTargetDispatches = 0;
+    const redirectTargets = ['fec0::1', 'ff0e::1'];
+    let currentTarget = redirectTargets[0];
+    const proxy = await startConnectProxyServer((authority) => {
+      if (authority === 'public.example:80') {
+        return {
+          status: 302,
+          headers: { Location: `http://[${currentTarget}]:12345/private` },
+        };
+      }
+      deniedTargetDispatches++;
+      return { body: '<html><body><h1>Denied target</h1></body></html>' };
+    });
+
+    envManager.set('URL_READER_HTTP_PROXY', proxy.url);
+    envManager.delete('NO_PROXY');
+    try {
+      for (const target of redirectTargets) {
+        currentTarget = target;
+        try {
+          await fetchAndConvertToMarkdown(mockServer as any, `http://public.example/${target}`, 1000);
+          assert.fail(`Expected redirect to native non-global IPv6 URL to be blocked: ${target}`);
+        } catch (error: any) {
+          assert.ok(error.message.includes('blocked by security policy'));
+        }
+      }
+      assert.equal(deniedTargetDispatches, 0, 'Denied redirect target must not be dispatched');
     } finally {
       await proxy.close();
       envManager.restore();

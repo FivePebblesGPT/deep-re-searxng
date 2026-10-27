@@ -8,14 +8,112 @@
 
 import { strict as assert } from 'node:assert';
 import { fileURLToPath } from 'node:url';
+import http from 'node:http';
+import { FetchMocker, createMockFetch } from '../helpers/mock-fetch.js';
 import request from 'supertest';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { createHttpServer } from '../../src/http-server.js';
+import { LOG_LEVEL_META_KEY, McpServer, createMcpHandler, isLegacyRequest } from '@modelcontextprotocol/server';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
+import {
+  DEFAULT_STATELESS_MAX_IN_FLIGHT,
+  DEFAULT_STATELESS_MAX_IN_FLIGHT_PER_IP,
+  DEFAULT_STATELESS_REQUEST_TIMEOUT_MS,
+  MAX_STATELESS_MAX_IN_FLIGHT,
+  createHttpServer,
+  resolveStatelessHttpConfig,
+  resolveHttpMaxSessions,
+  resolveHttpInitializeTimeoutMs,
+  resolveHttpSessionIdleTtlMs,
+  resolveHttpConcurrencyConfig,
+  resolveHttpSessionRequestTimeoutMs,
+} from '../../src/http-server.js';
+import { createMcpServer, ToolAdmissionController } from '../../src/index.js';
 import { testFunction, createTestResults, printTestSummary } from '../helpers/test-utils.js';
 import { EnvManager } from '../helpers/env-utils.js';
+import {
+  initializeDiagnosticSanitizer,
+  resetDiagnosticSanitizerForTests,
+} from '../../src/diagnostic-sanitizer.js';
 
 const results = createTestResults();
 const envManager = new EnvManager();
+
+async function withRequestDeadline(action: (timers: Map<NodeJS.Timeout, () => void>, stats: { created: number }) => Promise<void>): Promise<void> {
+  const originalSet = globalThis.setTimeout;
+  const originalClear = globalThis.clearTimeout;
+  const timers = new Map<NodeJS.Timeout, () => void>();
+  const stats = { created: 0 };
+  globalThis.setTimeout = ((callback: () => void, delay?: number, ...args: unknown[]) => {
+    const timer = originalSet(callback, delay === 1234 ? 60000 : delay, ...args);
+    if (delay === 1234) { stats.created++; timers.set(timer, callback); }
+    return timer;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: NodeJS.Timeout) => {
+    timers.delete(timer);
+    originalClear(timer);
+  }) as typeof clearTimeout;
+  try { await action(timers, stats); }
+  finally {
+    for (const timer of timers.keys()) originalClear(timer);
+    globalThis.setTimeout = originalSet;
+    globalThis.clearTimeout = originalClear;
+  }
+}
+
+async function withIdleClock(action: (clock: {
+  advance: (ms: number) => void;
+  timers: NodeJS.Timeout[];
+  sweep: () => Promise<void>;
+}) => Promise<void>): Promise<void> {
+  const originalNow = Object.getOwnPropertyDescriptor(performance, 'now');
+  const originalInterval = globalThis.setInterval;
+  const timers: NodeJS.Timeout[] = [];
+  const allTimers: NodeJS.Timeout[] = [];
+  const callbacks: Array<() => unknown> = [];
+  let now = 0;
+  Object.defineProperty(performance, 'now', { configurable: true, value: () => now });
+  globalThis.setInterval = ((callback: () => unknown, delay?: number) => {
+    const timer = originalInterval(callback, delay);
+    allTimers.push(timer);
+    if (delay === 60000) { timers.push(timer); callbacks.push(callback); }
+    return timer;
+  }) as typeof setInterval;
+  try {
+    await action({ advance: ms => { now += ms; }, timers, sweep: async () => { await callbacks.at(-1)!(); } });
+  } finally {
+    for (const timer of allTimers) clearInterval(timer);
+    globalThis.setInterval = originalInterval;
+    if (originalNow) Object.defineProperty(performance, 'now', originalNow);
+    else Reflect.deleteProperty(performance, 'now');
+  }
+}
+
+function initializeIdleSession(app: Awaited<ReturnType<typeof createHttpServer>>) {
+  return postStatelessMcp(app, { jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+    protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'idle-test', version: '1' },
+  } });
+}
+
+async function createIdleHarness(factory = createTestMcpServer) {
+  const transports: NodeStreamableHTTPServerTransport[] = [];
+  const app = await createHttpServer(() => {
+    const server = factory();
+    const connect = server.connect.bind(server);
+    server.connect = async transport => {
+      transports.push(transport as NodeStreamableHTTPServerTransport);
+      await connect(transport);
+    };
+    return server;
+  });
+  return { app, transports };
+}
+
+function createDeferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 function createTestMcpServer(): McpServer {
   return new McpServer(
@@ -24,8 +122,1981 @@ function createTestMcpServer(): McpServer {
   );
 }
 
+function postStatelessMcp(
+  app: Awaited<ReturnType<typeof createHttpServer>>,
+  body: unknown,
+  clientIp?: string,
+) {
+  const pending = request(app).post('/mcp')
+    .set('Content-Type', 'application/json')
+    .set('Accept', 'application/json, text/event-stream');
+  if (clientIp) pending.set('X-Forwarded-For', clientIp);
+  return pending.send(body);
+}
+
+async function captureConsoleOutput(action: () => Promise<void>): Promise<string[]> {
+  const originalError = console.error;
+  const originalWarn = console.warn;
+  const output: string[] = [];
+  const capture = (...args: unknown[]) => {
+    output.push(args.map(arg => {
+      if (arg instanceof Error) {
+        // Include `.code` explicitly: express-rate-limit logs a ValidationError
+        // whose code (e.g. ERR_ERL_UNEXPECTED_X_FORWARDED_FOR) lives on `.code`,
+        // so the assertion should not rely on it also appearing in `.message`.
+        const code = (arg as { code?: unknown }).code;
+        return code !== undefined
+          ? `${arg.name}[${String(code)}]: ${arg.message}`
+          : `${arg.name}: ${arg.message}`;
+      }
+      return String(arg);
+    }).join(' '));
+  };
+
+  console.error = capture;
+  console.warn = capture;
+
+  try {
+    await action();
+  } finally {
+    console.error = originalError;
+    console.warn = originalWarn;
+  }
+
+  return output;
+}
+
+async function assertAllowedMcpPreflight(
+  app: Awaited<ReturnType<typeof createHttpServer>>,
+  origin: string,
+): Promise<void> {
+  const options = await request(app).options('/mcp')
+    .set('Origin', origin)
+    .set('Access-Control-Request-Method', 'POST')
+    .set('Access-Control-Request-Headers', 'Content-Type, mcp-session-id, authorization, mcp-protocol-version, mcp-method, mcp-name, x-attacker');
+  assert.equal(options.status, 204);
+  assert.equal(options.headers['access-control-allow-origin'], origin);
+  assert.match(options.headers.vary || '', /Origin/);
+  const allowHeaders = (options.headers['access-control-allow-headers'] || '').toLowerCase();
+  for (const header of ['content-type', 'mcp-session-id', 'authorization', 'mcp-protocol-version', 'mcp-method', 'mcp-name']) {
+    assert.ok(allowHeaders.includes(header));
+  }
+  assert.ok(!allowHeaders.includes('x-attacker'));
+}
+
+async function createModernHttpHarness() {
+  const factoryEras: boolean[] = [];
+  const app = await createHttpServer((modern) => {
+    factoryEras.push(modern === true);
+    return createMcpServer(new ToolAdmissionController({
+      rateWindowMs: 60_000,
+      rateMax: 100,
+      maxInFlight: 4,
+    }), modern);
+  });
+  const envelope = {
+    'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+    'io.modelcontextprotocol/clientCapabilities': {},
+  };
+  const modernPost = (body: unknown, method: string, name?: string, sessionId?: string) => {
+    let pending = request(app).post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json')
+      .set('MCP-Protocol-Version', '2026-07-28')
+      .set('MCP-Method', method);
+    if (name) pending = pending.set('MCP-Name', name);
+    if (sessionId) pending = pending.set('MCP-Session-Id', sessionId);
+    return pending.send(body);
+  };
+  return { envelope, factoryEras, modernPost };
+}
+
+type ModernHttpHarness = Awaited<ReturnType<typeof createModernHttpHarness>>;
+
+async function assertModernDiscoveryAndResources({ envelope, modernPost }: ModernHttpHarness): Promise<void> {
+  const discovery = await modernPost({
+    jsonrpc: '2.0', id: 1, method: 'server/discover', params: { _meta: envelope },
+  }, 'server/discover');
+  assert.equal(discovery.status, 200);
+  assert.deepEqual(discovery.body.result.supportedVersions, ['2026-07-28']);
+
+  const tools = await modernPost({
+    jsonrpc: '2.0', id: 2, method: 'tools/list', params: { _meta: envelope },
+  }, 'tools/list');
+  assert.equal(tools.status, 200);
+  assert.deepEqual(tools.body.result.tools.map((tool: { name: string }) => tool.name), [
+    'searxng_web_search', 'searxng_search_suggestions', 'searxng_instance_info', 'web_url_read',
+  ]);
+
+  const resources = await modernPost({
+    jsonrpc: '2.0', id: 3, method: 'resources/list', params: { _meta: envelope },
+  }, 'resources/list', undefined, 'ignored-legacy-session');
+  assert.equal(resources.status, 200);
+  assert.equal(resources.headers['mcp-session-id'], undefined);
+  assert.deepEqual(resources.body.result.resources.map((resource: { uri: string }) => resource.uri), [
+    'config://server-config', 'help://usage-guide',
+  ]);
+
+  const help = await modernPost({
+    jsonrpc: '2.0', id: 4, method: 'resources/read',
+    params: { _meta: envelope, uri: 'help://usage-guide' },
+  }, 'resources/read', 'help://usage-guide');
+  assert.equal(help.status, 200);
+  assert.equal(help.body.result.contents[0].uri, 'help://usage-guide');
+  assert.equal(help.body.result.resultType, 'complete');
+}
+
+async function assertModernRequestLogs({ envelope, modernPost }: ModernHttpHarness): Promise<void> {
+  const quietCall = await modernPost({
+    jsonrpc: '2.0', id: 5, method: 'tools/call',
+    params: { _meta: envelope, name: 'searxng_web_search', arguments: { query: 'quiet' } },
+  }, 'tools/call', 'searxng_web_search');
+  assert.equal(quietCall.status, 200);
+  assert.doesNotMatch(quietCall.text, /notifications\/message/);
+  assert.match(quietCall.text, /"isError":true/);
+  assert.match(quietCall.text, /"resultType":"complete"/);
+
+  const debugCall = await modernPost({
+    jsonrpc: '2.0', id: 6, method: 'tools/call',
+    params: {
+      _meta: { ...envelope, [LOG_LEVEL_META_KEY]: 'debug' },
+      name: 'searxng_web_search',
+      arguments: { query: 'debug' },
+    },
+  }, 'tools/call', 'searxng_web_search');
+  assert.equal(debugCall.status, 200);
+  assert.match(debugCall.text, /notifications\/message/);
+  assert.match(debugCall.text, /Handling call_tool request: searxng_web_search/);
+  assert.match(debugCall.text, /"resultType":"complete"/);
+
+  const [overlappingQuiet, overlappingDebug] = await Promise.all([
+    modernPost({
+      jsonrpc: '2.0', id: 7, method: 'tools/call',
+      params: { _meta: envelope, name: 'searxng_web_search', arguments: { query: 'overlap-quiet' } },
+    }, 'tools/call', 'searxng_web_search'),
+    modernPost({
+      jsonrpc: '2.0', id: 8, method: 'tools/call',
+      params: {
+        _meta: { ...envelope, [LOG_LEVEL_META_KEY]: 'debug' },
+        name: 'searxng_web_search',
+        arguments: { query: 'overlap-debug' },
+      },
+    }, 'tools/call', 'searxng_web_search'),
+  ]);
+  assert.equal(overlappingQuiet.status, 200);
+  assert.doesNotMatch(overlappingQuiet.text, /notifications\/message/);
+  assert.equal(overlappingDebug.status, 200);
+  assert.match(overlappingDebug.text, /Handling call_tool request: searxng_web_search/);
+}
+
+async function assertModernHttpSurface(): Promise<void> {
+  const harness = await createModernHttpHarness();
+  await assertModernDiscoveryAndResources(harness);
+  envManager.set('SEARXNG_URL', 'ftp://search.example.com');
+  try {
+    await assertModernRequestLogs(harness);
+  } finally {
+    envManager.restore();
+  }
+  assert.deepEqual(harness.factoryEras, [true, true, true, true, true, true, true, true]);
+}
+
+async function assertLifecycleEvents(action: () => Promise<void>, expected: Record<string, number>): Promise<void> {
+  const originalWarn = console.warn;
+  const counts: Record<string, number> = {};
+  console.warn = (...values: unknown[]) => {
+    if (typeof values[0] !== 'string' || !values[0].startsWith('Stateful HTTP lifecycle: ')) {
+      originalWarn(...values); return;
+    }
+    assert.equal(values.length, 2);
+    assert.deepEqual(Object.keys(values[1] as object), ['count']);
+    const count = (values[1] as { count: number }).count;
+    assert.ok(Number.isSafeInteger(count) && count > 0);
+    const event = values[0].slice('Stateful HTTP lifecycle: '.length);
+    counts[event] = (counts[event] ?? 0) + count;
+  };
+  try { await action(); assert.deepEqual(counts, expected); }
+  finally { console.warn = originalWarn; }
+}
+
 async function runTests() {
+  await testFunction('late asynchronous close failures after the hard stop do not restart diagnostics', async () => {
+    await assertLifecycleEvents(async () => {
+      const finishClose = createDeferred();
+      let lateClose: Promise<void> | undefined;
+      const { app } = await createIdleHarness(() => {
+        const server = createTestMcpServer();
+        const close = server.close.bind(server);
+        server.close = () => {
+          lateClose = finishClose.promise.then(async () => {
+            await close();
+            throw new Error('late close rejection');
+          });
+          return lateClose;
+        };
+        return server;
+      });
+      await initializeIdleSession(app);
+      // Keep the process alive while the server's intentionally unref'ed timers run.
+      const keepAlive = setInterval(() => {}, 10000);
+      try {
+        await app.shutdownStateful();
+        assert.ok(lateClose, 'resource close must have started');
+        finishClose.resolve();
+        await assert.rejects(lateClose, /late close rejection/);
+        await new Promise(resolve => setImmediate(resolve));
+      } finally { clearInterval(keepAlive); finishClose.resolve(); }
+    }, { forced_shutdown: 1 });
+  }, results);
+
+  await testFunction('stateful capacity diagnostics aggregate privately and sink failure preserves HTTP outcomes', async () => {
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    const originalWarn = console.warn;
+    const output: unknown[][] = [];
+    const { app } = await createIdleHarness();
+    try {
+      const initialized = await initializeIdleSession(app);
+      assert.equal(initialized.status, 200);
+      console.warn = (...values) => { output.push(values); };
+      for (let i = 0; i < 5; i++) {
+        const rejected = await initializeIdleSession(app);
+        assert.equal(rejected.status, 503);
+        assert.equal(rejected.headers['retry-after'], '1');
+      }
+      assert.deepEqual(output, [['Stateful HTTP lifecycle: capacity_rejection', { count: 1 }]]);
+      const shutdown = app.shutdownStateful();
+      assert.deepEqual(output[1], ['Stateful HTTP lifecycle: capacity_rejection', { count: 4 }]);
+      assert.ok(!JSON.stringify(output).includes(initialized.headers['mcp-session-id']));
+      await shutdown;
+      console.warn = () => { throw new Error('failed diagnostic sink'); };
+      const second = await createIdleHarness();
+      try {
+        assert.equal((await initializeIdleSession(second.app)).status, 200);
+        assert.equal((await initializeIdleSession(second.app)).status, 503);
+      } finally { await second.app.shutdownStateful(); }
+    } finally {
+      console.warn = originalWarn;
+      await app.shutdownStateful();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateful shutdown drains active work, closes idle sessions and rejects new work after existing gates', async () => {
+    const resume = createDeferred();
+    const { app, transports } = await createIdleHarness();
+    const ids = [
+      (await initializeIdleSession(app)).headers['mcp-session-id'],
+      (await initializeIdleSession(app)).headers['mcp-session-id'],
+    ];
+    const closes = [0, 0];
+    transports.forEach((transport, i) => {
+      const close = transport.close.bind(transport);
+      transport.close = async () => { closes[i]++; await close(); };
+    });
+    const entered = createDeferred();
+    transports[0].handleRequest = async (_req, res) => { entered.resolve(); await resume.promise; res.end(); };
+    const active = postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', ids[0]).then(r => r);
+    await entered.promise;
+    const started = performance.now();
+    const shutdown = app.shutdownStateful();
+    try {
+      assert.equal(app.shutdownStateful(), shutdown);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(closes, [0, 1], 'an idle session closes while active work drains');
+      for (const pending of [
+        postStatelessMcp(app, { jsonrpc: '2.0', id: 3, method: 'tools/list' }),
+        postStatelessMcp(app, { jsonrpc: '2.0', id: 3, method: 'tools/list' }).set('mcp-session-id', 'unknown'),
+        request(app).get('/mcp'),
+        request(app).delete('/mcp'),
+        request(app).delete('/mcp').set('mcp-session-id', ids[0]),
+      ]) {
+        const response = await pending;
+        assert.equal(response.status, 503);
+        assert.equal(response.headers['retry-after'], '5');
+        assert.deepEqual(response.body, { jsonrpc: '2.0', error: { code: -32000, message: 'Server shutting down' }, id: null });
+      }
+      assert.equal(closes[0], 0, 'DELETE during drain has no side effect');
+      assert.equal((await request(app).post('/mcp').set('Content-Type', 'application/json').send('{')).status, 500, 'preserve the existing sanitized parser-error response');
+      assert.equal((await request(app).post('/mcp').set('Content-Type', 'text/plain').send('bad')).status, 415);
+      resume.resolve();
+      assert.equal((await active).status, 200);
+      await shutdown;
+      assert.ok(performance.now() - started < 3500, 'finished work need not wait for the drain deadline');
+      assert.deepEqual(closes, [1, 1], 'transport close is shared with MCP server close');
+    } finally { resume.resolve(); await shutdown; }
+  }, results);
+
+  await testFunction('stateful shutdown preserves authentication and rate gates', async () => {
+    envManager.set('MCP_HTTP_AUTH_TOKEN', 'shutdown-test-token');
+    envManager.set('MCP_HTTP_HARDEN', 'true');
+    envManager.set('MCP_HTTP_ALLOWED_HOSTS', 'allowed.example');
+    envManager.set('MCP_HTTP_ALLOWED_ORIGINS', 'https://allowed.example');
+    envManager.set('MCP_RATE_INIT_MAX', '1');
+    try {
+      const app = await createHttpServer(createTestMcpServer);
+      await app.shutdownStateful();
+      assert.equal((await request(app).get('/mcp')).status, 401);
+      assert.equal((await request(app).get('/mcp').set('Authorization', 'Bearer shutdown-test-token').set('Host', 'wrong.example')).status, 403);
+      const first = await postStatelessMcp(app, { jsonrpc: '2.0', id: 1, method: 'tools/list' }).set('Authorization', 'Bearer shutdown-test-token').set('Host', 'allowed.example');
+      assert.equal(first.status, 503);
+      const second = await postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('Authorization', 'Bearer shutdown-test-token').set('Host', 'allowed.example');
+      assert.equal(second.status, 429);
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('shutdown has one five-second hard stop despite hung initialization and rejecting or hanging resource closes', async () => {
+    await assertLifecycleEvents(async () => {
+    envManager.set('MCP_HTTP_SESSION_REQUEST_TIMEOUT_MS', '1234');
+    const servers: McpServer[] = [];
+    const serverCloses = [0, 0, 0];
+    const transportCloses = [0, 0, 0];
+    const closedAt = [0, 0, 0];
+    const originalServerClose: Array<() => Promise<void>> = [];
+    const originalTransportClose: Array<() => Promise<void>> = [];
+    const initializeEntered = createDeferred();
+    const originalDateNow = Date.now;
+    const { app, transports } = await createIdleHarness(() => {
+      const server = createTestMcpServer();
+      const index = servers.length;
+      servers.push(server);
+      originalServerClose.push(server.close.bind(server));
+      server.close = async () => {
+        serverCloses[index]++;
+        if (index === 1) throw new Error('expected server close rejection');
+        await new Promise(() => {});
+      };
+      if (index === 2) server.connect = async () => { initializeEntered.resolve(); await new Promise(() => {}); };
+      return server;
+    });
+    const listener = app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => listener.once('listening', resolve));
+    const port = (listener.address() as { port: number }).port;
+    const clients: http.ClientRequest[] = [];
+    const streams: http.IncomingMessage[] = [];
+    try {
+      await withRequestDeadline(async timers => {
+        const id = (await initializeIdleSession(app)).headers['mcp-session-id'];
+        await initializeIdleSession(app);
+        const initializing = initializeIdleSession(app).then(r => r);
+        await initializeEntered.promise;
+        transports.forEach((transport, i) => {
+          originalTransportClose.push(transport.close.bind(transport));
+          transport.close = async () => {
+            transportCloses[i]++; closedAt[i] = performance.now();
+            if (i === 1) throw new Error('expected transport close rejection');
+            await new Promise(() => {});
+          };
+        });
+        const postEntered = createDeferred();
+        transports[0].handleRequest = async (req, res, body) => {
+          if (req.method === 'GET' || (body as { id?: number })?.id === 99) {
+            res.writeHead(200, { 'Content-Type': 'text/event-stream' }); res.write(': open\n\n'); return;
+          }
+          postEntered.resolve(); await new Promise(() => {});
+        };
+        const open = (method: 'GET' | 'POST') => new Promise<void>((resolve, reject) => {
+          const client = http.request({ host: '127.0.0.1', port, path: '/mcp', method, headers: {
+            'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-session-id': id,
+          } }, response => { streams.push(response); response.on('error', () => {}); response.resume(); resolve(); });
+          clients.push(client); client.on('error', reject);
+          client.end(method === 'POST' ? JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'tools/list' }) : undefined);
+        });
+        await open('GET'); await open('POST');
+        const active = postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', id).then(r => r);
+        await postEntered.promise;
+        assert.equal(timers.size, 2);
+        const started = performance.now();
+        Date.now = () => 1;
+        const postStreamClosed = new Promise<void>(resolve => streams[1].once('close', resolve));
+        const shutdown = app.shutdownStateful();
+        assert.equal(app.shutdownStateful(), shutdown);
+        await new Promise(resolve => setTimeout(resolve, 50));
+        assert.equal(streams[0].destroyed, true, 'GET closes without waiting for POST drain');
+        assert.equal(streams[1].destroyed, false, 'started POST gets its drain window');
+        assert.deepEqual(serverCloses, [0, 1, 0], 'idle resources close independently');
+        await shutdown;
+        const elapsed = performance.now() - started;
+        assert.ok(elapsed >= 4900 && elapsed < 7000, `one total deadline, observed ${elapsed}ms`);
+        assert.ok(closedAt[0] - started >= 3900 && closedAt[2] - started >= 3900);
+        assert.deepEqual(serverCloses, [1, 1, 1]);
+        assert.deepEqual(transportCloses, [1, 1, 1]);
+        assert.equal(timers.size, 0);
+        for (const response of await Promise.all([active, initializing])) {
+          assert.equal(response.status, 503);
+          assert.equal(response.headers['retry-after'], '5');
+          assert.equal(response.body.error.message, 'Server shutting down');
+        }
+        await postStreamClosed;
+        assert.equal(streams[1].destroyed, true);
+      });
+    } finally {
+      Date.now = originalDateNow;
+      clients.forEach(client => client.destroy());
+      transports.forEach((transport, i) => { if (originalTransportClose[i]) transport.close = originalTransportClose[i]; });
+      servers.forEach((server, i) => { server.close = originalServerClose[i]; });
+      await Promise.all(transports.map(t => t.close()));
+      await Promise.all(servers.map(s => s.close()));
+      await new Promise<void>(resolve => listener.close(() => resolve()));
+      envManager.restore();
+    }
+    }, { forced_shutdown: 2, close_failure: 2 });
+  }, results);
+
+  await testFunction('an admitted request timeout keeps its 504 contract during shutdown drain', async () => {
+    await assertLifecycleEvents(async () => {
+    envManager.set('MCP_HTTP_SESSION_REQUEST_TIMEOUT_MS', '1234');
+    try {
+      await withRequestDeadline(async timers => {
+        const { app, transports } = await createIdleHarness();
+        const id = (await initializeIdleSession(app)).headers['mcp-session-id'];
+        const started = createDeferred();
+        let ended = false;
+        let flushed = false;
+        transports[0].handleRequest = async (_req, res) => {
+          const originalEnd = res.end;
+          // Model end() having queued bytes while the socket is still flushing.
+          Object.defineProperty(res, 'writableEnded', { configurable: true, get: () => ended });
+          res.end = ((...args: unknown[]) => {
+            ended = true;
+            setTimeout(() => {
+              flushed = true;
+              Reflect.apply(originalEnd, res, args);
+            }, 50);
+            return res;
+          }) as typeof res.end;
+          started.resolve();
+          await new Promise(() => {});
+        };
+        const pending = postStatelessMcp(app, { jsonrpc: '2.0', id: 7, method: 'tools/list' }).set('mcp-session-id', id).then(r => r);
+        await started.promise;
+        const shutdown = app.shutdownStateful();
+        [...timers.values()][0]();
+        await Promise.resolve();
+        assert.equal(ended, true);
+        assert.equal(flushed, false);
+        const response = await pending;
+        assert.equal(response.status, 504);
+        assert.equal(response.body.error.message, 'Stateful request timed out');
+        assert.equal(response.body.id, 7);
+        await shutdown;
+        assert.equal(timers.size, 0);
+      });
+    } finally { envManager.restore(); }
+    }, { post_timeout: 1 });
+  }, results);
+
+  await testFunction('legacy stateless HTTP retains listener-only shutdown behavior', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    try {
+      const app = await createHttpServer(createTestMcpServer);
+      const shutdown = app.shutdownStateful();
+      assert.equal(app.shutdownStateful(), shutdown);
+      await shutdown;
+      assert.equal((await postStatelessMcp(app, { jsonrpc: '2.0', id: 1, method: 'tools/list' })).status, 200);
+      assert.equal((await request(app).get('/mcp')).status, 405);
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('stateful request timeout accepts zero and strict bounds without leaking invalid values', async () => {
+    try {
+      for (const [raw, expected] of [['', 0], ['0', 0], ['1000', 1000], ['2147483647', 2147483647]] as const) {
+        envManager.set('MCP_HTTP_SESSION_REQUEST_TIMEOUT_MS', raw);
+        assert.equal(resolveHttpSessionRequestTimeoutMs(), expected);
+      }
+      const messages = await captureConsoleOutput(async () => {
+        for (const raw of ['999', '-1', '2147483648', '1e3', '1.5', 'private-timeout-marker']) {
+          envManager.set('MCP_HTTP_SESSION_REQUEST_TIMEOUT_MS', raw);
+          assert.equal(resolveHttpSessionRequestTimeoutMs(), 0);
+        }
+      });
+      assert.equal(messages.length, 6);
+      assert.doesNotMatch(messages.join('\n'), /private-timeout-marker/);
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('stateful request timeout echoes only scalar IDs and releases session capacity exactly once', async () => {
+    envManager.set('MCP_HTTP_SESSION_REQUEST_TIMEOUT_MS', '1234');
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    try {
+      await withRequestDeadline(async (timers, stats) => {
+        const { app, transports } = await createIdleHarness();
+        const cases: Array<[unknown, unknown]> = [
+          [{ id: 'request', method: 'tools/list' }, 'request'],
+          [{ id: 42, method: 'tools/list' }, 42],
+          [[{ id: 1, method: 'tools/list' }], null],
+          [{ method: 'notifications/initialized' }, null],
+          [{ method: 'tools/list' }, null],
+          [{ id: {}, method: 'tools/list' }, null],
+          [{ id: null, method: 'tools/list' }, null],
+        ];
+        for (const [body, expectedId] of cases) {
+          const id = (await initializeIdleSession(app)).headers['mcp-session-id'];
+          assert.ok(id);
+          assert.equal(timers.size, 0, 'initialize must not start a request deadline');
+          const transport = transports.at(-1)!;
+          const started = createDeferred();
+          const envelope = Array.isArray(body) ? body.map(item => ({ jsonrpc: '2.0', ...item })) : { jsonrpc: '2.0', ...body as object };
+          // Current SDK classification rejects invalid IDs before
+          // admission. Preserve that gate, then exercise the timeout's defensive
+          // ID mapping with a transport fixture on an otherwise valid request.
+          const defensiveCase = !Array.isArray(body) && Object.hasOwn(body as object, 'id') && typeof (body as { id: unknown }).id === 'object';
+          if (defensiveCase) {
+            const createdBefore = stats.created;
+            const rejected = await postStatelessMcp(app, envelope).set('mcp-session-id', id);
+            assert.equal(rejected.status, 400);
+            assert.equal(timers.size, 0);
+            assert.equal(stats.created, createdBefore, 'SDK rejection precedes request timer creation');
+          }
+          transport.handleRequest = async req => {
+            if (defensiveCase) (req as http.IncomingMessage & { body: unknown }).body = envelope;
+            started.resolve(); await new Promise(() => {});
+          };
+          const pending = postStatelessMcp(app, defensiveCase ? { jsonrpc: '2.0', id: 1, method: 'tools/list' } : envelope).set('mcp-session-id', id).set('mcp-protocol-version', '2024-11-05').then(r => r);
+          await Promise.race([started.promise, pending.then(r => { throw new Error(`Request rejected before transport: ${r.status} ${r.text}`); })]);
+          assert.equal(timers.size, 1);
+          const [timer, expire] = [...timers][0];
+          assert.equal(timer.hasRef(), false);
+          expire();
+          const response = await pending;
+          assert.equal(response.status, 504);
+          assert.deepEqual(response.body, { jsonrpc: '2.0', error: { code: -32000, message: 'Stateful request timed out' }, id: expectedId });
+          assert.equal(timers.size, 0);
+          assert.equal((await postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', id).set('mcp-protocol-version', '2024-11-05')).status, 404);
+          assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id).set('mcp-protocol-version', '2024-11-05')).status, 404);
+          await transport.close();
+        }
+      });
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('one timed-out stateful POST invalidates pending siblings and cancels all deadlines', async () => {
+    envManager.set('MCP_HTTP_SESSION_REQUEST_TIMEOUT_MS', '1234');
+    envManager.set('MCP_HTTP_MAX_IN_FLIGHT_TOTAL', '2');
+    envManager.set('MCP_HTTP_MAX_IN_FLIGHT_PER_SESSION', '2');
+    try {
+      await withRequestDeadline(async timers => {
+        const { app, transports } = await createIdleHarness();
+        const id = (await initializeIdleSession(app)).headers['mcp-session-id'];
+        let entered = createDeferred();
+        transports[0].handleRequest = async () => { entered.resolve(); await new Promise(() => {}); };
+        const post = (requestId: number) => postStatelessMcp(app, { jsonrpc: '2.0', id: requestId, method: 'tools/list' }).set('mcp-session-id', id).set('mcp-protocol-version', '2024-11-05');
+        const first = post(1).then(r => r);
+        await entered.promise;
+        entered = createDeferred();
+        const second = post(2).then(r => r);
+        await entered.promise;
+        assert.equal((await post(3)).status, 503);
+        assert.equal(timers.size, 2, 'rejected requests must not have a deadline');
+        [...timers.values()][0]();
+        assert.equal((await first).status, 504);
+        const sibling = await second;
+        assert.equal(sibling.status, 404);
+        assert.deepEqual(sibling.body, { jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null });
+        assert.equal(timers.size, 0);
+        assert.equal((await initializeIdleSession(app)).status, 200);
+        await Promise.all(transports.map(t => t.close()));
+      });
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('stateful timeout destroys started POST siblings and GET streams despite wall-clock jumps', async () => {
+    envManager.set('MCP_HTTP_SESSION_REQUEST_TIMEOUT_MS', '1000');
+    const originalNow = Date.now;
+    const clients: http.ClientRequest[] = [];
+    const responses: http.IncomingMessage[] = [];
+    const { app, transports } = await createIdleHarness();
+    const id = (await initializeIdleSession(app)).headers['mcp-session-id'];
+    transports[0].handleRequest = async (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write(': open\n\n');
+    };
+    const listener = app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => listener.once('listening', resolve));
+    const port = (listener.address() as { port: number }).port;
+    const open = (method: string) => new Promise<void>((resolve, reject) => {
+      const client = http.request({ host: '127.0.0.1', port, path: '/mcp', method, headers: {
+        'content-type': 'application/json', accept: 'application/json, text/event-stream',
+        'mcp-session-id': id, 'mcp-protocol-version': '2024-11-05',
+      } }, response => { responses.push(response); response.on('error', () => {}); response.resume(); resolve(); });
+      clients.push(client); client.on('error', reject);
+      client.end(method === 'POST' ? JSON.stringify({ jsonrpc: '2.0', id: clients.length, method: 'tools/list' }) : undefined);
+    });
+    try {
+      await open('GET');
+      await open('POST');
+      await open('POST');
+      Date.now = () => 1;
+      await new Promise(resolve => setTimeout(resolve, 1150));
+      assert.equal(responses.length, 3);
+      assert.ok(responses.every(response => response.destroyed));
+      assert.ok(responses.every(response => response.statusCode === 200), 'never write a second status after headers');
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 404);
+    } finally {
+      Date.now = originalNow;
+      clients.forEach(client => client.destroy());
+      await Promise.all(transports.map(t => t.close()));
+      await new Promise<void>(resolve => listener.close(() => resolve()));
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('a POST timeout closes a still-delivering initialize stream even if transport close hangs', async () => {
+    envManager.set('MCP_HTTP_SESSION_REQUEST_TIMEOUT_MS', '1234');
+    const sendGate = createDeferred();
+    let transport!: NodeStreamableHTTPServerTransport;
+    let releaseInitialize: (() => void) | undefined;
+    let restoreClose = (): void => {};
+    let serverCloseAttempts = 0;
+    const app = await createHttpServer(() => {
+      const server = createTestMcpServer();
+      const closeServer = server.close.bind(server);
+      server.close = async () => { serverCloseAttempts++; await closeServer(); };
+      const connect = server.connect.bind(server);
+      server.connect = async candidate => {
+        transport = candidate as NodeStreamableHTTPServerTransport;
+        const send = transport.send.bind(transport);
+        transport.send = async (message, options) => {
+          await new Promise(resolve => setTimeout(resolve, 50));
+          await send(message, options); await sendGate.promise;
+        };
+        const handle = transport.handleRequest.bind(transport);
+        transport.handleRequest = async (req, res, body) => {
+          const end = res.end;
+          res.end = ((...args: Parameters<typeof res.end>) => {
+            releaseInitialize = () => { res.end = end; end.apply(res, args); };
+            return res;
+          }) as typeof res.end;
+          await handle(req, res, body);
+        };
+        await connect(candidate);
+      };
+      return server;
+    });
+    const listener = app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => listener.once('listening', resolve));
+    const port = (listener.address() as { port: number }).port;
+    let incoming!: http.IncomingMessage;
+    let client!: http.ClientRequest;
+    try {
+      await withRequestDeadline(async timers => {
+        await new Promise<void>((resolve, reject) => {
+          client = http.request({ host: '127.0.0.1', port, path: '/mcp', method: 'POST', headers: {
+            'content-type': 'application/json', accept: 'application/json, text/event-stream',
+          } }, response => { incoming = response; response.on('error', () => {}); response.once('data', () => resolve()); response.resume(); });
+          client.on('error', reject);
+          client.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+            protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'pending-initialize', version: '1' },
+          } }));
+        });
+        assert.equal(timers.size, 0);
+        const started = createDeferred();
+        transport.handleRequest = async () => { started.resolve(); await new Promise(() => {}); };
+        const close = transport.close.bind(transport);
+        restoreClose = () => { transport.close = close; };
+        transport.close = async () => { await new Promise(() => {}); };
+        const pending = postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' })
+          .set('mcp-session-id', incoming.headers['mcp-session-id'] as string).then(r => r);
+        await started.promise;
+        const streamClosed = new Promise<void>(resolve => incoming.once('close', resolve));
+        [...timers.values()][0]();
+        assert.equal((await pending).status, 504);
+        await streamClosed;
+        assert.equal(incoming.destroyed, true);
+        assert.equal(timers.size, 0);
+        assert.equal(serverCloseAttempts, 1, 'a hanging transport close must not prevent the server close attempt');
+      });
+    } finally {
+      sendGate.resolve(); releaseInitialize?.(); client?.destroy(); incoming?.destroy();
+      restoreClose(); await transport?.close();
+      await new Promise<void>(resolve => listener.close(() => resolve()));
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateful request timers cancel on successful responses and remain absent when disabled', async () => {
+    try {
+      await withRequestDeadline(async timers => {
+        for (const timeout of ['0', '1234']) {
+          envManager.set('MCP_HTTP_SESSION_REQUEST_TIMEOUT_MS', timeout);
+          const { app, transports } = await createIdleHarness();
+          const id = (await initializeIdleSession(app)).headers['mcp-session-id'];
+          let expiredAfterFinish: (() => void) | undefined;
+          transports[0].handleRequest = async (_req, res) => {
+            assert.equal(timers.size, timeout === '0' ? 0 : 1);
+            expiredAfterFinish = [...timers.values()][0];
+            res.end();
+          };
+          await postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', id).set('mcp-protocol-version', '2024-11-05');
+          assert.equal(timers.size, 0);
+          expiredAfterFinish?.();
+          assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 204, 'a late deadline must not invalidate a finished response');
+        }
+      });
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('globally rejected stateful POSTs do not refresh idle activity', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    envManager.set('MCP_HTTP_MAX_IN_FLIGHT_TOTAL', '2');
+    const resume = createDeferred();
+    try {
+      await withIdleClock(async clock => {
+        const { app, transports } = await createIdleHarness();
+        const ids: string[] = [];
+        for (let i = 0; i < 3; i++) ids.push((await initializeIdleSession(app)).headers['mcp-session-id']);
+        const post = (id: string) => postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', id);
+        const running = [];
+        try {
+          for (let i = 0; i < 2; i++) {
+            const started = createDeferred();
+            transports[i].handleRequest = async (_req, res) => { started.resolve(); await resume.promise; res.end(); };
+            running.push(post(ids[i]).then(r => r));
+            await started.promise;
+          }
+          clock.advance(500);
+          assert.equal((await post(ids[2])).status, 503);
+          clock.advance(501);
+          await clock.sweep();
+          assert.equal((await request(app).delete('/mcp').set('mcp-session-id', ids[2])).status, 404);
+        } finally {
+          resume.resolve(); await Promise.allSettled(running);
+          await Promise.all(transports.map(t => t.close()));
+        }
+      });
+    } finally { resume.resolve(); envManager.restore(); }
+  }, results);
+
+  await testFunction('rejected stateful GET requests do not refresh idle activity', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    envManager.set('MCP_HTTP_MAX_GET_STREAMS_TOTAL', '1');
+    try {
+      await withIdleClock(async clock => {
+        const { app, transports } = await createIdleHarness();
+        const target = (await initializeIdleSession(app)).headers['mcp-session-id'];
+        // GET streams do not protect an otherwise idle session from expiry.
+        const listener = app.listen(0, '127.0.0.1');
+        await new Promise<void>(resolve => listener.once('listening', resolve));
+        const address = listener.address() as import('node:net').AddressInfo;
+        let stream: http.ServerResponse | undefined;
+        transports[0].handleRequest = async (_req, res) => {
+          stream = res;
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          res.write(': open\n\n');
+        };
+        let client: http.ClientRequest | undefined;
+        try {
+          await new Promise<void>((resolve, reject) => {
+            client = http.get({ host: '127.0.0.1', port: address.port, path: '/mcp', headers: { 'mcp-session-id': target, Accept: 'text/event-stream' } }, response => { response.resume(); resolve(); });
+            client.on('error', reject);
+          });
+          clock.advance(500);
+          assert.equal((await request(app).get('/mcp').set('mcp-session-id', target)).status, 503);
+          clock.advance(501);
+          await clock.sweep();
+          assert.equal((await request(app).delete('/mcp').set('mcp-session-id', target)).status, 404);
+        } finally {
+          stream?.end(); client?.destroy();
+          await Promise.all(transports.map(t => t.close()));
+          await new Promise<void>(resolve => listener.close(() => resolve()));
+        }
+      });
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('stateful failures and duplicate terminal events release a slot exactly once', async () => {
+    envManager.set('MCP_HTTP_MAX_IN_FLIGHT_TOTAL', '1');
+    envManager.set('MCP_HTTP_MAX_IN_FLIGHT_PER_SESSION', '1');
+    const { app, transports } = await createIdleHarness();
+    const id = (await initializeIdleSession(app)).headers['mcp-session-id'];
+    const post = () => postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', id);
+    try {
+      assert.equal((await initializeIdleSession(app)).status, 503, 'a one-slot deployment preserves its established session');
+      transports[0].handleRequest = async () => { throw new Error('test failure'); };
+      assert.equal((await post()).status, 500);
+      assert.equal((await post()).status, 500);
+      transports[0].handleRequest = async (req, res) => {
+        req.emit('aborted'); req.emit('aborted');
+        res.end();
+      };
+      assert.equal((await post()).status, 200);
+      const started = createDeferred();
+      const resume = createDeferred();
+      transports[0].handleRequest = async (_req, res) => { started.resolve(); await resume.promise; res.end(); };
+      const pending = post().then(r => r);
+      try {
+        await started.promise;
+        assert.equal((await post()).status, 503, 'duplicate release must not allow the counter to underflow');
+      } finally { resume.resolve(); await pending; }
+    } finally { await Promise.all(transports.map(t => t.close())); envManager.restore(); }
+  }, results);
+
+  await testFunction('stateful concurrency configuration validates every bound without echoing invalid values', async () => {
+    const settings = [
+      ['MCP_HTTP_MAX_IN_FLIGHT_PER_SESSION', 'postPerSession', 16, 256],
+      ['MCP_HTTP_MAX_GET_STREAMS_PER_SESSION', 'getPerSession', 4, 32],
+      ['MCP_HTTP_MAX_IN_FLIGHT_TOTAL', 'postTotal', 256, 4096],
+      ['MCP_HTTP_MAX_GET_STREAMS_TOTAL', 'getTotal', 256, 4096],
+    ] as const;
+    try {
+      const warnings = await captureConsoleOutput(async () => {
+        for (const [name, key, fallback, maximum] of settings) {
+          for (const raw of ['', '1', String(maximum)]) {
+            envManager.set(name, raw);
+            assert.equal(resolveHttpConcurrencyConfig()[key], raw ? Number(raw) : fallback);
+          }
+          for (const raw of ['0', '-1', '1.5', '1e2', '2requests', String(maximum + 1), 'private-capacity-fixture']) {
+            envManager.set(name, raw);
+            assert.equal(resolveHttpConcurrencyConfig()[key], fallback);
+          }
+          envManager.delete(name);
+        }
+      });
+      assert.doesNotMatch(warnings.join('\n'), /private-capacity-fixture/);
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('stateful GET streams retain global and per-session slots after handler return and release on close', async () => {
+    envManager.set('MCP_HTTP_MAX_GET_STREAMS_PER_SESSION', '1');
+    envManager.set('MCP_HTTP_MAX_GET_STREAMS_TOTAL', '2');
+    const { app, transports } = await createIdleHarness();
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) ids.push((await initializeIdleSession(app)).headers['mcp-session-id']);
+    const listener = app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => listener.once('listening', resolve));
+    const address = listener.address() as import('node:net').AddressInfo;
+    const responses: import('express').Response[] = [];
+    const clients: http.ClientRequest[] = [];
+    for (const transport of transports) transport.handleRequest = async (_req, res) => {
+      responses.push(res as import('express').Response);
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write(': open\n\n');
+    };
+    const get = (id: string) => new Promise<http.IncomingMessage>((resolve, reject) => {
+      const client = http.get({ host: '127.0.0.1', port: address.port, path: '/mcp', headers: { 'mcp-session-id': id, Accept: 'text/event-stream' } }, response => {
+        response.resume(); resolve(response);
+      });
+      clients.push(client); client.on('error', reject);
+    });
+    try {
+      assert.equal((await get(ids[0])).statusCode, 200);
+      assert.equal((await get(ids[0])).statusCode, 503);
+      assert.equal((await get(ids[1])).statusCode, 200);
+      assert.equal((await get(ids[2])).statusCode, 503);
+      assert.equal(responses.length, 2);
+      responses[0].end();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal((await get(ids[2])).statusCode, 200);
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', ids[1])).status, 204);
+      assert.equal((await get(ids[0])).statusCode, 200);
+    } finally {
+      responses.forEach(r => r.end()); clients.forEach(c => c.destroy());
+      await Promise.all(transports.map(t => t.close()));
+      await new Promise<void>(resolve => listener.close(() => resolve()));
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('initialization reserves headroom for established POSTs', async () => {
+    envManager.set('MCP_HTTP_MAX_IN_FLIGHT_TOTAL', '2');
+    const { app, transports } = await createIdleHarness();
+    const id = (await initializeIdleSession(app)).headers['mcp-session-id'];
+    const connect = McpServer.prototype.connect;
+    const entered = createDeferred();
+    const resume = createDeferred();
+    McpServer.prototype.connect = async function (transport) {
+      entered.resolve(); await resume.promise; await connect.call(this, transport);
+    };
+    const pending = initializeIdleSession(app).then(r => r);
+    try {
+      await entered.promise;
+      assert.equal((await initializeIdleSession(app)).status, 503);
+      assert.equal((await postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', id)).status, 200);
+      resume.resolve();
+      assert.equal((await pending).status, 200);
+    } finally {
+      resume.resolve(); await pending;
+      McpServer.prototype.connect = connect;
+      await Promise.all(transports.map(t => t.close())); envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateful POST concurrency rejects excess work and retains capacity until SDK responses finish', async () => {
+    envManager.set('MCP_HTTP_MAX_IN_FLIGHT_PER_SESSION', '1');
+    envManager.set('MCP_HTTP_MAX_IN_FLIGHT_TOTAL', '2');
+    const entered: Array<() => void> = [];
+    const resume = createDeferred();
+    const { app, transports } = await createIdleHarness(() => {
+      const server = createTestMcpServer();
+      server.registerTool('hold', {}, async () => {
+        entered.shift()?.();
+        await resume.promise;
+        return { content: [{ type: 'text', text: 'complete' }] };
+      });
+      return server;
+    });
+    const ids = await Promise.all([initializeIdleSession(app), initializeIdleSession(app)]).then(rs => rs.map(r => r.headers['mcp-session-id']));
+    const post = (session: string, id: number) => postStatelessMcp(app, {
+      jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'hold', arguments: {} },
+    }).set('mcp-session-id', session).timeout(3000);
+    const running = [];
+    try {
+      for (let i = 0; i < 2; i++) {
+        const started = new Promise<void>(resolve => entered.push(resolve));
+        running.push(post(ids[i], i + 2).then(r => r));
+        await started;
+        const excess = await post(ids[i], i + 10);
+        assert.equal(excess.status, 503);
+        assert.equal(excess.headers['retry-after'], '1');
+        assert.deepEqual(excess.body, { jsonrpc: '2.0', error: { code: -32000, message: 'Server busy' }, id: null });
+      }
+      assert.equal((await initializeIdleSession(app)).status, 503);
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', ids[0])).status, 204);
+      assert.equal((await initializeIdleSession(app)).status, 200, 'DELETE frees a global POST slot before slow SDK work finishes');
+      resume.resolve();
+      await Promise.allSettled(running);
+      assert.equal((await post(ids[1], 30)).status, 200);
+    } finally {
+      resume.resolve();
+      await Promise.allSettled(running);
+      await Promise.all(transports.map(t => t.close()));
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('idle TTL configuration has strict bounds and value-free warnings', async () => {
+    const warnings = await captureConsoleOutput(async () => {
+      for (const [raw, value] of [['', 0], ['0', 0], ['1000', 1000], [' +001000 ', 1000], ['2147483647', 2147483647]] as const) {
+        envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', raw);
+        assert.equal(resolveHttpSessionIdleTtlMs(), value);
+      }
+      for (const raw of ['1', '999', '-1', '1.5', '1e3', '1000ms', '2147483648', 'private-ttl-fixture']) {
+        envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', raw);
+        assert.equal(resolveHttpSessionIdleTtlMs(), 0);
+      }
+    });
+    assert.equal(warnings.length, 8);
+    assert.ok(warnings.every(warning => warning.includes('MCP_HTTP_SESSION_IDLE_TTL_MS')));
+    assert.ok(warnings.every(warning => !warning.includes('private-ttl-fixture')));
+  }, results);
+
+  await testFunction('disabled idle expiry creates no sweep and never reclaims sessions at capacity', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '0');
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    await withIdleClock(async clock => {
+      const app = await createHttpServer(createTestMcpServer);
+      const baselineTimers = clock.timers.length;
+      const first = await initializeIdleSession(app);
+      assert.equal(clock.timers.length, baselineTimers);
+      clock.advance(100000);
+      assert.equal((await initializeIdleSession(app)).status, 503);
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', first.headers['mcp-session-id'])).status, 204);
+    });
+  }, results);
+
+  await testFunction('idle expiry uses one unref sweep and monotonic activity from admitted POSTs', async () => {
+    await assertLifecycleEvents(async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    await withIdleClock(async clock => {
+      const { app, transports } = await createIdleHarness();
+      const baselineTimers = clock.timers.length;
+      const first = await initializeIdleSession(app);
+      const id = first.headers['mcp-session-id'];
+      const close = transports[0].close.bind(transports[0]);
+      let closes = 0;
+      transports[0].close = async () => { closes++; await close(); };
+      assert.equal(clock.timers.length, baselineTimers + 1);
+      assert.equal(clock.timers.at(-1)!.hasRef(), false);
+      clock.advance(900);
+      assert.equal((await postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', id)).status, 200);
+      clock.advance(900);
+      await clock.sweep();
+      const realDateNow = Date.now;
+      try { Date.now = () => realDateNow() + 1e9; await clock.sweep(); }
+      finally { Date.now = realDateNow; }
+      assert.equal(closes, 0, 'wall-clock jumps must not expire a monotonic fresh session');
+      clock.advance(101);
+      await clock.sweep();
+      assert.equal(closes, 1);
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 404);
+      await clock.sweep();
+    });
+    }, { idle_reclaim: 1 });
+  }, results);
+
+  await testFunction('capacity expiry never evicts fresh sessions and runs at most once per second', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    await withIdleClock(async clock => {
+      const app = await createHttpServer(createTestMcpServer);
+      const first = await initializeIdleSession(app);
+      clock.advance(500);
+      assert.equal((await initializeIdleSession(app)).status, 503);
+      clock.advance(501);
+      assert.equal((await initializeIdleSession(app)).status, 503, 'throttled classification must not run again');
+      clock.advance(500);
+      const replacement = await initializeIdleSession(app);
+      assert.equal(replacement.status, 200);
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', first.headers['mcp-session-id'])).status, 404);
+      await request(app).delete('/mcp').set('mcp-session-id', replacement.headers['mcp-session-id']);
+    });
+  }, results);
+
+  await testFunction('only fulfilled sends refresh idle activity and expiry finalizes once', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    const originalSend = NodeStreamableHTTPServerTransport.prototype.send;
+    NodeStreamableHTTPServerTransport.prototype.send = async function (message, options) {
+      if ('method' in message && message.method === 'notifications/reject') throw new Error('controlled rejected send');
+      await originalSend.call(this, message, options);
+    };
+    try {
+      await withIdleClock(async clock => {
+        const { app, transports } = await createIdleHarness();
+        const first = await initializeIdleSession(app);
+        const transport = transports[0];
+        const originalClose = transport.close.bind(transport);
+        let closes = 0;
+        transport.close = async () => { closes++; await originalClose(); };
+        clock.advance(900);
+        await transport.send({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'info', data: 'activity' } });
+        clock.advance(900);
+        await clock.sweep();
+        assert.equal(closes, 0);
+        await assert.rejects(transport.send({ jsonrpc: '2.0', method: 'notifications/reject' }));
+        clock.advance(101);
+        await clock.sweep();
+        await clock.sweep();
+        assert.equal(closes, 1);
+        assert.equal((await request(app).delete('/mcp').set('mcp-session-id', first.headers['mcp-session-id'])).status, 404);
+      });
+    } finally { NodeStreamableHTTPServerTransport.prototype.send = originalSend; }
+  }, results);
+
+  await testFunction('idle sweeps protect pending POSTs and release duplicate completion signals once', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    await withIdleClock(async clock => {
+      const { app, transports } = await createIdleHarness();
+      const initialized = await initializeIdleSession(app);
+      const id = initialized.headers['mcp-session-id'];
+      const entered = createDeferred();
+      const resume = createDeferred();
+      const handle = transports[0].handleRequest.bind(transports[0]);
+      transports[0].handleRequest = async (req, res) => {
+        entered.resolve();
+        await resume.promise;
+        res.statusCode = 202;
+        res.end();
+      };
+      const pending = postStatelessMcp(app, { jsonrpc: '2.0', method: 'notifications/initialized' }).set('mcp-session-id', id).then(response => response);
+      try {
+        await entered.promise;
+        clock.advance(2000);
+        await clock.sweep();
+        resume.resolve();
+        assert.equal((await pending).status, 202);
+        transports[0].handleRequest = handle;
+        await clock.sweep();
+        assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 404);
+      } finally { resume.resolve(); await pending; }
+    });
+  }, results);
+
+  await testFunction('idle expiry protects a real SDK tool call until its response completes', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    await withIdleClock(async clock => {
+      const entered = createDeferred();
+      const resume = createDeferred();
+      const { app, transports } = await createIdleHarness(() => {
+        const server = createTestMcpServer();
+        server.registerTool('slow', {}, async () => {
+          entered.resolve();
+          await resume.promise;
+          return { content: [{ type: 'text', text: 'slow-complete' }] };
+        });
+        return server;
+      });
+      const initialized = await initializeIdleSession(app);
+      const id = initialized.headers['mcp-session-id'];
+      const close = transports[0].close.bind(transports[0]);
+      let closes = 0;
+      transports[0].close = async () => { closes++; await close(); };
+      const pending = postStatelessMcp(app, {
+        jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'slow', arguments: {} },
+      }).set('mcp-session-id', id).timeout(3000).then(response => response);
+      try {
+        await entered.promise;
+        await new Promise<void>(resolve => setImmediate(resolve));
+        clock.advance(2000);
+        await clock.sweep();
+        assert.equal(closes, 0, 'pending SDK work must remain protected past the idle TTL');
+        resume.resolve();
+        const response = await pending;
+        assert.equal(response.status, 200);
+        assert.match(response.text, /slow-complete/);
+        clock.advance(1001);
+        await clock.sweep();
+        assert.equal(closes, 1);
+        assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 404);
+      } finally { resume.resolve(); await pending; }
+    });
+  }, results);
+
+  await testFunction('idle sweeps exclude initializing and closing sessions and never overlap', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    await withIdleClock(async clock => {
+      const entered = createDeferred();
+      const resume = createDeferred();
+      const app = await createHttpServer(() => {
+        const server = createTestMcpServer();
+        const connect = server.connect.bind(server);
+        server.connect = async transport => { entered.resolve(); await resume.promise; await connect(transport); };
+        return server;
+      });
+      const pending = initializeIdleSession(app).then(response => response);
+      await entered.promise;
+      clock.advance(2000);
+      await clock.sweep();
+      resume.resolve();
+      const initialized = await pending;
+      assert.equal(initialized.status, 200);
+      await request(app).delete('/mcp').set('mcp-session-id', initialized.headers['mcp-session-id']);
+    });
+    await withIdleClock(async clock => {
+      const { app, transports } = await createIdleHarness();
+      const first = await initializeIdleSession(app);
+      const close = transports[0].close.bind(transports[0]);
+      const resumeClose = createDeferred();
+      let closes = 0;
+      transports[0].close = async () => { closes++; await resumeClose.promise; await close(); };
+      clock.advance(2000);
+      const sweeping = clock.sweep();
+      await clock.sweep();
+      assert.equal(closes, 1);
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', first.headers['mcp-session-id'])).status, 404);
+      resumeClose.resolve();
+      await sweeping;
+    });
+  }, results);
+
+  await testFunction('registered initialization stays protected across failed DELETE and late delivery', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    const entered = createDeferred();
+    const resume = createDeferred();
+    const originalSend = NodeStreamableHTTPServerTransport.prototype.send;
+    NodeStreamableHTTPServerTransport.prototype.send = async function (message, options) {
+      entered.resolve();
+      await resume.promise;
+      await originalSend.call(this, message, options);
+    };
+    try {
+      await withIdleClock(async clock => {
+        const { app, transports } = await createIdleHarness();
+        const pending = initializeIdleSession(app).then(response => response);
+        await entered.promise;
+        const id = transports[0].sessionId!;
+        assert.ok(id);
+        const close = transports[0].close.bind(transports[0]);
+        const closing = createDeferred();
+        const failClose = createDeferred();
+        let attempts = 0;
+        let holdClose = false;
+        transports[0].close = async () => {
+          attempts++;
+          if (holdClose) { closing.resolve(); await failClose.promise; }
+          throw new Error('controlled DELETE failure');
+        };
+        try {
+          await captureConsoleOutput(async () => {
+            clock.advance(2000);
+            await clock.sweep();
+            assert.equal(attempts, 0);
+            assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 500);
+            clock.advance(2000);
+            await clock.sweep();
+            assert.equal(attempts, 1, 'failed DELETE must restore initializing state');
+            holdClose = true;
+            const deletion = request(app).delete('/mcp').set('mcp-session-id', id).then(response => response);
+            await closing.promise;
+            resume.resolve();
+            assert.equal((await pending).status, 200);
+            clock.advance(2000);
+            await clock.sweep();
+            assert.equal(attempts, 2, 'delivery must not reactivate a closing session');
+            failClose.resolve();
+            assert.equal((await deletion).status, 500);
+          });
+          transports[0].close = close;
+          await clock.sweep();
+          assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 404);
+        } finally { resume.resolve(); failClose.resolve(); transports[0].close = close; await pending; await close(); }
+      });
+    } finally { resume.resolve(); NodeStreamableHTTPServerTransport.prototype.send = originalSend; }
+  }, results);
+
+  await testFunction('established GET refreshes activity but expires with a bare stream close', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    await withIdleClock(async clock => {
+      const app = await createHttpServer(createTestMcpServer);
+      const first = await initializeIdleSession(app);
+      const id = first.headers['mcp-session-id'];
+      const listener = app.listen(0, '127.0.0.1');
+      await new Promise<void>(resolve => listener.once('listening', resolve));
+      clock.advance(900);
+      const ended = createDeferred();
+      const chunks: string[] = [];
+      const incoming = await new Promise<http.IncomingMessage>((resolve, reject) => {
+        const pending = http.get({ host: '127.0.0.1', port: (listener.address() as { port: number }).port, path: '/mcp', headers: {
+          accept: 'text/event-stream', 'mcp-session-id': id,
+        } }, response => {
+          response.on('data', chunk => chunks.push(chunk.toString()));
+          response.on('end', ended.resolve);
+          resolve(response);
+        });
+        pending.setTimeout(3000, () => pending.destroy(new Error('GET stream did not close')));
+        pending.on('error', reject);
+      });
+      try {
+        assert.equal(incoming.statusCode, 200);
+        clock.advance(900);
+        await clock.sweep();
+        assert.equal(incoming.complete, false);
+        const before = chunks.join('');
+        clock.advance(101);
+        await clock.sweep();
+        await ended.promise;
+        assert.equal(chunks.join(''), before, 'expiry must not inject a terminal event');
+        assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 404);
+      } finally { incoming.destroy(); listener.closeAllConnections(); await new Promise<void>(resolve => listener.close(() => resolve())); }
+    });
+  }, results);
+
+  await testFunction('DELETE activity and failed idle close preserve retryable sessions', async () => {
+    envManager.set('MCP_HTTP_SESSION_IDLE_TTL_MS', '1000');
+    await withIdleClock(async clock => {
+      const { app, transports } = await createIdleHarness();
+      const first = await initializeIdleSession(app);
+      const id = first.headers['mcp-session-id'];
+      const close = transports[0].close.bind(transports[0]);
+      let attempts = 0;
+      transports[0].close = async () => { attempts++; throw new Error('controlled close failure'); };
+      clock.advance(900);
+      await captureConsoleOutput(async () => {
+        assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 500);
+        clock.advance(900);
+        await clock.sweep();
+        assert.equal(attempts, 1, 'DELETE start must refresh activity');
+        clock.advance(101);
+        await clock.sweep();
+        assert.equal(attempts, 2);
+      });
+      transports[0].close = close;
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', id)).status, 204);
+    });
+  }, results);
+  await testFunction('initialize timeout has strict boundaries and private invalid-value warnings', async () => {
+    try {
+      for (const [raw, expected] of [['', 30000], [' ', 30000], ['1000', 1000], ['2147483647', 2147483647]] as const) {
+        envManager.set('MCP_HTTP_INITIALIZE_TIMEOUT_MS', raw);
+        assert.equal(resolveHttpInitializeTimeoutMs(), expected);
+      }
+      const messages = await captureConsoleOutput(async () => {
+        for (const raw of ['0', '999', '2147483648', '1e3', '0x1000', '1.5', 'private-deadline-marker']) {
+          envManager.set('MCP_HTTP_INITIALIZE_TIMEOUT_MS', raw);
+          assert.equal(resolveHttpInitializeTimeoutMs(), 30000);
+        }
+      });
+      assert.equal(messages.length, 7);
+      assert.doesNotMatch(messages.join('\n'), /private-deadline-marker/);
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('initialize deadline includes synchronous construction and ignores wall-clock changes', async () => {
+    envManager.set('MCP_HTTP_INITIALIZE_TIMEOUT_MS', '1000');
+    const originalNow = Date.now;
+    let closed = 0;
+    const app = await createHttpServer(() => {
+      const server = createTestMcpServer();
+      const close = server.close.bind(server);
+      server.close = async () => { closed++; await close(); };
+      Date.now = () => 1;
+      const end = performance.now() + 1050;
+      while (performance.now() < end) { /* synchronous factory delay */ }
+      return server;
+    });
+    try {
+      const response = await postStatelessMcp(app, {
+        jsonrpc: '2.0', id: 42, method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'sync', version: '1' } },
+      });
+      assert.equal(response.status, 504);
+      assert.equal(response.body.id, 42);
+      assert.equal(closed, 1);
+    } finally { Date.now = originalNow; envManager.restore(); }
+  }, results);
+
+  await testFunction('delivered initialize response cancels the deadline even while its SSE stream stays open', async () => {
+    envManager.set('MCP_HTTP_INITIALIZE_TIMEOUT_MS', '1000');
+    let finishResponse: (() => void) | undefined;
+    const app = await createHttpServer(() => {
+      const server = createTestMcpServer();
+      const connect = server.connect.bind(server);
+      server.connect = async transport => {
+        const nodeTransport = transport as NodeStreamableHTTPServerTransport;
+        const send = nodeTransport.send.bind(nodeTransport);
+        nodeTransport.send = async (message, options) => {
+          // Ensure the HTTP adapter starts streaming instead of buffering a
+          // complete response and adding Content-Length before end is held.
+          await new Promise(resolve => setTimeout(resolve, 50));
+          await send(message, options);
+        };
+        const handle = nodeTransport.handleRequest.bind(nodeTransport);
+        nodeTransport.handleRequest = async (req, res, body) => {
+          const end = res.end;
+          res.end = ((...args: Parameters<typeof res.end>) => {
+            finishResponse = () => { res.end = end; end.apply(res, args); };
+            return res;
+          }) as typeof res.end;
+          await handle(req, res, body);
+        };
+        await connect(transport);
+      };
+      return server;
+    });
+    const listener = app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => listener.once('listening', resolve));
+    const port = (listener.address() as { port: number }).port;
+    const body = { jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+      protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'stream', version: '1' },
+    } };
+    let incoming: http.IncomingMessage | undefined;
+    const delivered = createDeferred();
+    const pending = http.request({ host: '127.0.0.1', port, path: '/mcp', method: 'POST', headers: {
+      'content-type': 'application/json', accept: 'application/json, text/event-stream',
+    } }, response => {
+      incoming = response;
+      let text = '';
+      response.on('data', chunk => { text += chunk.toString(); if (text.includes('"result"')) delivered.resolve(); });
+    });
+    pending.on('error', () => {});
+    pending.end(JSON.stringify(body));
+    try {
+      await Promise.race([delivered.promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('initialize event missing')), 2200))]);
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      assert.equal(incoming?.destroyed, false, 'initialize deadline must not govern the later stream lifetime');
+      assert.equal(incoming?.complete, false);
+      finishResponse?.();
+      const sessionId = incoming!.headers['mcp-session-id'] as string;
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', sessionId)).status, 204);
+    } finally {
+      finishResponse?.(); pending.destroy(); incoming?.destroy();
+      listener.closeAllConnections();
+      await new Promise<void>(resolve => listener.close(() => resolve()));
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('initialize deadline returns scalar-id 504 and restores capacity during a stalled connect', async () => {
+    await assertLifecycleEvents(async () => {
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    envManager.set('MCP_HTTP_INITIALIZE_TIMEOUT_MS', '1000');
+    const resume = createDeferred();
+    let first = true;
+    let firstCloseCount = 0;
+    const app = await createHttpServer(() => {
+      const server = createTestMcpServer();
+      if (first) {
+        first = false;
+        const connect = server.connect.bind(server);
+        server.connect = async transport => { await resume.promise; await connect(transport); };
+        const close = server.close.bind(server);
+        server.close = async () => { firstCloseCount++; await close(); };
+      }
+      return server;
+    });
+    const initialize = () => postStatelessMcp(app, {
+      jsonrpc: '2.0', id: 'slow-init', method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'deadline', version: '1' } },
+    }).timeout(2200);
+    try {
+      const expired = await initialize();
+      assert.equal(expired.status, 504);
+      assert.deepEqual(expired.body, { jsonrpc: '2.0', error: { code: -32000, message: 'Initialization timed out' }, id: 'slow-init' });
+      assert.equal(firstCloseCount, 1);
+      const replacement = await initialize();
+      assert.equal(replacement.status, 200);
+      resume.resolve();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal((await initialize()).status, 503);
+      assert.equal(firstCloseCount, 1);
+      await request(app).delete('/mcp').set('mcp-session-id', replacement.headers['mcp-session-id']);
+    } finally { resume.resolve(); envManager.restore(); }
+    }, { initialize_timeout: 1, capacity_rejection: 1 });
+  }, results);
+
+  await testFunction('initialize response-event timeout destroys started SSE and invalidates its exposed session', async () => {
+    envManager.set('MCP_HTTP_INITIALIZE_TIMEOUT_MS', '1000');
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    const resume = createDeferred();
+    const aborted = createDeferred();
+    let first = true;
+    const app = await createHttpServer(() => {
+      const server = createTestMcpServer();
+      if (first) {
+        first = false;
+        const connect = server.connect.bind(server);
+        server.connect = async transport => {
+          const send = transport.send.bind(transport);
+          transport.send = async (message, options) => { await resume.promise; await send(message, options); };
+          await connect(transport);
+        };
+      }
+      return server;
+    });
+    const listener = app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => listener.once('listening', resolve));
+    const port = (listener.address() as { port: number }).port;
+    const body = { jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+      protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'send-timeout', version: '1' },
+    } };
+    let incoming: http.IncomingMessage | undefined;
+    const pending = http.request({ host: '127.0.0.1', port, path: '/mcp', method: 'POST', headers: {
+      'content-type': 'application/json', accept: 'application/json, text/event-stream',
+    } }, response => {
+      incoming = response;
+      response.resume();
+      response.once('aborted', aborted.resolve);
+    });
+    pending.on('error', () => {});
+    pending.end(JSON.stringify(body));
+    try {
+      await Promise.race([aborted.promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('started response was not destroyed')), 2200))]);
+      assert.equal(incoming?.statusCode, 200, 'headers were already sent before timeout');
+      const staleId = incoming!.headers['mcp-session-id'] as string;
+      assert.ok(staleId);
+      assert.equal((await postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', staleId)).status, 404);
+      const replacement = await postStatelessMcp(app, body);
+      assert.equal(replacement.status, 200);
+      resume.resolve();
+      await request(app).delete('/mcp').set('mcp-session-id', replacement.headers['mcp-session-id']);
+    } finally {
+      resume.resolve(); pending.destroy(); incoming?.destroy();
+      listener.closeAllConnections();
+      await new Promise<void>(resolve => listener.close(() => resolve()));
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('SSE response finish does not cancel a still-pending SDK send deadline', async () => {
+    envManager.set('MCP_HTTP_INITIALIZE_TIMEOUT_MS', '1000');
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    const resume = createDeferred();
+    let created = 0;
+    let initialCloseCount = 0;
+    const originalSend = NodeStreamableHTTPServerTransport.prototype.send;
+    NodeStreamableHTTPServerTransport.prototype.send = async function (message, options) {
+      await originalSend.call(this, message, options);
+      await resume.promise;
+    };
+    try {
+      const app = await createHttpServer(() => {
+        const server = createTestMcpServer();
+        if (created++ === 0) {
+          const close = server.close.bind(server);
+          server.close = async () => { initialCloseCount++; await close(); };
+        }
+        return server;
+      });
+      const body = {
+        jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+          protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'pending-send', version: '1' },
+        },
+      };
+      const initialized = await postStatelessMcp(app, body);
+      assert.equal(initialized.status, 200);
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      const stale = await postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' })
+        .set('mcp-session-id', initialized.headers['mcp-session-id']);
+      assert.equal(stale.status, 404);
+      assert.equal(initialCloseCount, 1);
+      const replacement = await postStatelessMcp(app, body);
+      assert.equal(replacement.status, 200, 'timed-out send must return its sole capacity slot');
+      resume.resolve();
+      await request(app).delete('/mcp').set('mcp-session-id', replacement.headers['mcp-session-id']);
+      assert.equal(initialCloseCount, 1);
+    } finally {
+      resume.resolve();
+      NodeStreamableHTTPServerTransport.prototype.send = originalSend;
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateful session capacity configuration is strict and warning values stay private', async () => {
+    try {
+      for (const [raw, expected] of [['', 1000], ['  ', 1000], ['1', 1], ['10000', 10000], ['+2', 2]] as const) {
+        envManager.set('MCP_HTTP_MAX_SESSIONS', raw);
+        assert.equal(resolveHttpMaxSessions(), expected);
+      }
+      const messages = await captureConsoleOutput(async () => {
+        for (const raw of ['0', '-1', '10001', '1e3', '1.2', '0x10', 'private-invalid-marker']) {
+          envManager.set('MCP_HTTP_MAX_SESSIONS', raw);
+          assert.equal(resolveHttpMaxSessions(), 1000);
+        }
+      });
+      assert.equal(messages.length, 7);
+      assert.doesNotMatch(messages.join('\n'), /private-invalid-marker/);
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('stateful capacity reserves initializing sessions and leaves existing sessions usable', async () => {
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    envManager.set('MCP_RATE_INIT_MAX', '100');
+    const entered = createDeferred();
+    const resume = createDeferred();
+    let constructions = 0;
+    const app = await createHttpServer(() => {
+      constructions++;
+      const server = createTestMcpServer();
+      const connect = server.connect.bind(server);
+      server.connect = async transport => {
+        entered.resolve();
+        await resume.promise;
+        await connect(transport);
+      };
+      return server;
+    });
+    const initialize = () => postStatelessMcp(app, {
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'capacity', version: '1' } },
+    });
+    const first = initialize().then(value => value);
+    try {
+      await entered.promise;
+      const rejected = await Promise.all(Array.from({ length: 4 }, () => initialize().timeout(1500)));
+      for (const response of rejected) {
+        assert.equal(response.status, 503);
+        assert.equal(response.headers['retry-after'], '1');
+        assert.deepEqual(response.body, { jsonrpc: '2.0', error: { code: -32000, message: 'Server busy' }, id: null });
+      }
+      assert.equal(constructions, 1);
+      resume.resolve();
+      const active = await first;
+      const sessionId = active.headers['mcp-session-id'];
+      assert.equal(active.status, 200);
+      assert.equal((await initialize()).status, 503);
+      const existing = await postStatelessMcp(app, { jsonrpc: '2.0', id: 2, method: 'tools/list' }).set('mcp-session-id', sessionId);
+      assert.equal(existing.status, 200);
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', sessionId)).status, 204);
+      const replacement = await initialize();
+      assert.equal(replacement.status, 200);
+      assert.equal(constructions, 2);
+      await request(app).delete('/mcp').set('mcp-session-id', replacement.headers['mcp-session-id']);
+    } finally {
+      resume.resolve();
+      await first;
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('failed stateful construction, connection, and handling release capacity', async () => {
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    const originalHandle = NodeStreamableHTTPServerTransport.prototype.handleRequest;
+    try {
+      for (const failure of ['construction', 'connection', 'handler']) {
+        let first = true;
+        const app = await createHttpServer(() => {
+          const fail = first;
+          first = false;
+          if (fail && failure === 'construction') throw new Error('controlled construction failure');
+          const server = createTestMcpServer();
+          if (fail && failure === 'connection') server.connect = async () => { throw new Error('controlled connection failure'); };
+          return server;
+        });
+        let failHandler = failure === 'handler';
+        NodeStreamableHTTPServerTransport.prototype.handleRequest = async function (...args) {
+          if (failHandler) { failHandler = false; throw new Error('controlled handler failure'); }
+          return originalHandle.apply(this, args);
+        };
+        const initialize = () => postStatelessMcp(app, {
+          jsonrpc: '2.0', id: 1, method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'failure', version: '1' } },
+        });
+        assert.equal((await initialize()).status, 500, failure);
+        const recovered = await initialize();
+        assert.equal(recovered.status, 200, failure);
+        assert.equal((await initialize()).status, 503, 'one released reservation must not release a second slot');
+        await request(app).delete('/mcp').set('mcp-session-id', recovered.headers['mcp-session-id']);
+      }
+    } finally {
+      NodeStreamableHTTPServerTransport.prototype.handleRequest = originalHandle;
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('aborted initialize releases capacity before a delayed connection settles', async () => {
+    envManager.set('MCP_HTTP_MAX_SESSIONS', '1');
+    const entered = createDeferred();
+    const resume = createDeferred();
+    let first = true;
+    let abandonedTransport: NodeStreamableHTTPServerTransport | undefined;
+    const app = await createHttpServer(() => {
+      const server = createTestMcpServer();
+      if (first) {
+        first = false;
+        const connect = server.connect.bind(server);
+        server.connect = async transport => {
+          abandonedTransport = transport as NodeStreamableHTTPServerTransport;
+          await connect(transport);
+          entered.resolve();
+          await resume.promise;
+        };
+      }
+      return server;
+    });
+    const listener = app.listen(0, '127.0.0.1');
+    await new Promise<void>(resolve => listener.once('listening', resolve));
+    const port = (listener.address() as { port: number }).port;
+    const body = { jsonrpc: '2.0', id: 1, method: 'initialize', params: {
+      protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'abort', version: '1' },
+    } };
+    const pending = http.request({ host: '127.0.0.1', port, path: '/mcp', method: 'POST', headers: {
+      'content-type': 'application/json', accept: 'application/json, text/event-stream',
+    } });
+    pending.on('error', () => {});
+    pending.end(JSON.stringify(body));
+    try {
+      await entered.promise;
+      const closed = createDeferred();
+      const originalClose = abandonedTransport!.close.bind(abandonedTransport);
+      abandonedTransport!.close = async () => { await originalClose(); closed.resolve(); };
+      pending.destroy();
+      await closed.promise;
+      const replacement = await postStatelessMcp(app, body);
+      assert.equal(replacement.status, 200);
+      resume.resolve();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal((await postStatelessMcp(app, body)).status, 503);
+      await request(app).delete('/mcp').set('mcp-session-id', replacement.headers['mcp-session-id']);
+    } finally {
+      pending.destroy();
+      resume.resolve();
+      listener.closeAllConnections();
+      await new Promise<void>(resolve => listener.close(() => resolve()));
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('modern Lite calls honor explicit search and URL read options', async () => {
+    envManager.set('SEARXNG_LITE_TOOLS', 'true');
+    envManager.set('SEARXNG_URL', 'https://test-searx.example.com');
+    envManager.set('MCP_HTTP_ALLOW_PRIVATE_URLS', 'true');
+    const target = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html><body><p>abcdefghijklmnopqrstuvwxyz</p></body></html>');
+    });
+    await new Promise<void>((resolve) => target.listen(0, '127.0.0.1', resolve));
+    const fetchMocker = new FetchMocker();
+    fetchMocker.mock(createMockFetch({ json: { results: [
+      { title: 'One', url: 'https://example.com/one', content: 'First', score: 1 },
+      { title: 'Two', url: 'https://example.com/two', content: 'Second', score: 0.5 },
+    ] } }));
+    try {
+      const { envelope, modernPost } = await createModernHttpHarness();
+      const search = await modernPost({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+        _meta: envelope, name: 'searxng_web_search', arguments: {
+          query: 'modern-lite-explicit-options', response_format: 'json', result_detail: 'compact', num_results: 1,
+        },
+      } }, 'tools/call', 'searxng_web_search');
+      assert.equal(search.status, 200);
+      const parsed = JSON.parse(search.body.result.content[0].text);
+      assert.equal(parsed.results.length, 1);
+      assert.deepEqual(Object.keys(parsed), ['results']);
+      const address = target.address();
+      assert.ok(address && typeof address === 'object');
+      const read = await modernPost({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+        _meta: envelope, name: 'web_url_read', arguments: { url: `http://127.0.0.1:${address.port}`, maxLength: 5 },
+      } }, 'tools/call', 'web_url_read');
+      assert.equal(read.status, 200);
+      assert.ok(read.body.result.content[0].text.includes('abcde'));
+      assert.ok(!read.body.result.content[0].text.includes('abcdef'));
+    } finally {
+      fetchMocker.restore();
+      target.closeAllConnections();
+      await new Promise<void>((resolve) => target.close(() => resolve()));
+      envManager.restore();
+    }
+  }, results);
   console.log('🧪 Integration Testing: http-server.ts\n');
+
+  await testFunction('SDK rejects absent or mismatched protocol headers before invoking a modern tool', async () => {
+    let calls = 0;
+    const handler = createMcpHandler(() => {
+      const server = createTestMcpServer();
+      server.registerTool('header_probe', { inputSchema: {} }, async () => {
+        calls += 1;
+        return { content: [{ type: 'text' as const, text: 'ok' }] };
+      });
+      return server;
+    }, { legacy: 'reject' });
+    const send = (id: string | number, version?: string) => {
+      const headers = new Headers({ 'Content-Type': 'application/json', Accept: 'application/json',
+        'MCP-Method': 'tools/call', 'MCP-Name': 'header_probe' });
+      if (version !== undefined) headers.set('MCP-Protocol-Version', version);
+      return handler.fetch(new Request('http://localhost/mcp', {
+        method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: {
+          name: 'header_probe', arguments: {}, _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities': {},
+          },
+        } }),
+      }));
+    };
+    try {
+      for (const id of [7, 'header-check']) {
+        for (const version of [undefined, '2025-03-26']) {
+          const rejected = await send(id, version);
+          assert.equal(rejected.status, 400);
+          const body = await rejected.json();
+          assert.equal(body.id, id);
+          assert.equal(body.error.code, -32020);
+          assert.equal(calls, 0);
+        }
+      }
+      const accepted = await send('valid', '2026-07-28');
+      assert.equal(accepted.status, 200);
+      assert.equal((await accepted.json()).result.content[0].text, 'ok');
+      assert.equal(calls, 1);
+    } finally { await handler.close(); }
+  }, results);
+
+  await testFunction('product HTTP rejects header mismatches without tool work and releases its admission slot', async () => {
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    let calls = 0;
+    try {
+      const app = await createHttpServer(() => {
+        const server = createTestMcpServer();
+        server.registerTool('header_probe', { inputSchema: {} }, async () => {
+          calls += 1;
+          return { content: [{ type: 'text' as const, text: 'ok' }] };
+        });
+        return server;
+      });
+      const send = (id: string | number, version?: string) => {
+        const pending = request(app).post('/mcp').set('Content-Type', 'application/json')
+          .set('Accept', 'application/json').set('MCP-Method', 'tools/call').set('MCP-Name', 'header_probe');
+        if (version !== undefined) pending.set('MCP-Protocol-Version', version);
+        return pending.send({ jsonrpc: '2.0', id, method: 'tools/call', params: {
+          name: 'header_probe', arguments: {}, _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities': {},
+          },
+        } });
+      };
+      for (const id of [7, 'product-header-check']) {
+        for (const version of [undefined, '2025-03-26']) {
+          const response = await send(id, version);
+          assert.equal(response.status, 400);
+          assert.equal(response.body.id, id);
+          assert.equal(response.body.error.code, -32020);
+          assert.equal(calls, 0);
+        }
+      }
+      const accepted = await send('valid', '2026-07-28');
+      assert.equal(accepted.status, 200, 'all rejected requests must release the single global/per-IP slot');
+      assert.equal(accepted.body.result.content[0].text, 'ok');
+      assert.equal(calls, 1);
+    } finally { envManager.restore(); }
+  }, results);
+
+  await testFunction('official classifier keeps a headerless body-primary modern opening out of legacy', async () => {
+    const body = {
+      jsonrpc: '2.0', id: 9, method: 'server/discover',
+      params: { _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28' } },
+    };
+    const webRequest = new Request('http://localhost/mcp', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    assert.equal(await isLegacyRequest(webRequest, body), false);
+  }, results);
+
+  await testFunction('non-JSON POST uses the init limiter and returns 415 before server construction', async () => {
+    envManager.set('MCP_RATE_INIT_MAX', '1');
+    let constructions = 0;
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        return createTestMcpServer();
+      });
+      const response = await request(app).post('/mcp')
+        .set('Content-Type', 'text/plain')
+        .send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }));
+      assert.equal(response.status, 415);
+      assert.equal(response.headers['ratelimit-limit'], '1');
+      assert.deepEqual(response.body, {
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Unsupported Media Type' },
+        id: null,
+      });
+
+      const exhausted = await request(app).post('/mcp')
+        .set('Content-Type', 'text/plain')
+        .send('{}');
+      assert.equal(exhausted.status, 429);
+      assert.equal(constructions, 0);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction(
+    'modern HTTP requests compose the official handler and retain the four-tool surface',
+    assertModernHttpSurface,
+    results,
+  );
+
+  await testFunction('stateless HTTP configuration defaults are disabled and bounded', async () => {
+    envManager.delete('MCP_HTTP_STATELESS');
+    envManager.delete('MCP_HTTP_STATELESS_MAX_IN_FLIGHT');
+    envManager.delete('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP');
+    envManager.delete('MCP_HTTP_STATELESS_REQUEST_TIMEOUT_MS');
+
+    try {
+      assert.deepEqual(resolveStatelessHttpConfig(), {
+        enabled: false,
+        maxInFlight: DEFAULT_STATELESS_MAX_IN_FLIGHT,
+        maxInFlightPerIp: DEFAULT_STATELESS_MAX_IN_FLIGHT_PER_IP,
+        requestTimeoutMs: DEFAULT_STATELESS_REQUEST_TIMEOUT_MS,
+      });
+      assert.equal(DEFAULT_STATELESS_MAX_IN_FLIGHT, 16);
+      assert.equal(DEFAULT_STATELESS_MAX_IN_FLIGHT_PER_IP, 8);
+      assert.equal(DEFAULT_STATELESS_REQUEST_TIMEOUT_MS, 900000);
+      assert.equal(MAX_STATELESS_MAX_IN_FLIGHT, 256);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless HTTP configuration normalizes explicit boundaries in dependency order', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '4');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '8');
+    envManager.set('MCP_HTTP_STATELESS_REQUEST_TIMEOUT_MS', '1000');
+
+    try {
+      const output = await captureConsoleOutput(async () => {
+        assert.deepEqual(resolveStatelessHttpConfig(), {
+          enabled: true,
+          maxInFlight: 4,
+          maxInFlightPerIp: 4,
+          requestTimeoutMs: 1000,
+        });
+      });
+      assert.equal(output.filter(line => line.includes('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP')).length, 1);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless HTTP configuration rejects unsafe values without echoing them', async () => {
+    const unsafeGlobal = '999999999999999999999';
+    const unsafeTimeout = 'timeout-secret-value';
+    envManager.set('MCP_HTTP_STATELESS', 'TRUE');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', unsafeGlobal);
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '0');
+    envManager.set('MCP_HTTP_STATELESS_REQUEST_TIMEOUT_MS', unsafeTimeout);
+
+    try {
+      const output = await captureConsoleOutput(async () => {
+        assert.deepEqual(resolveStatelessHttpConfig(), {
+          enabled: false,
+          maxInFlight: DEFAULT_STATELESS_MAX_IN_FLIGHT,
+          maxInFlightPerIp: DEFAULT_STATELESS_MAX_IN_FLIGHT_PER_IP,
+          requestTimeoutMs: DEFAULT_STATELESS_REQUEST_TIMEOUT_MS,
+        });
+      });
+      const combined = output.join('\n');
+      assert.equal(output.filter(line => line.includes('Ignoring invalid MCP_HTTP_STATELESS')).length, 4);
+      assert.ok(!combined.includes(unsafeGlobal));
+      assert.ok(!combined.includes(unsafeTimeout));
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless HTTP configuration rejects exact out-of-range boundaries', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '257');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '257');
+    envManager.set('MCP_HTTP_STATELESS_REQUEST_TIMEOUT_MS', '999');
+
+    try {
+      const output = await captureConsoleOutput(async () => {
+        assert.deepEqual(resolveStatelessHttpConfig(), {
+          enabled: true,
+          maxInFlight: DEFAULT_STATELESS_MAX_IN_FLIGHT,
+          maxInFlightPerIp: DEFAULT_STATELESS_MAX_IN_FLIGHT_PER_IP,
+          requestTimeoutMs: DEFAULT_STATELESS_REQUEST_TIMEOUT_MS,
+        });
+      });
+      assert.equal(output.filter(line => line.includes('Ignoring invalid MCP_HTTP_STATELESS_')).length, 3);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('default trust proxy setting remains disabled', async () => {
+    envManager.delete('MCP_HTTP_TRUST_PROXY');
+
+    const app = await createHttpServer(() => createTestMcpServer());
+    assert.equal(app.get('trust proxy'), false);
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('GET /health accepts X-Forwarded-For when trust proxy is unset', async () => {
+    envManager.delete('MCP_HTTP_TRUST_PROXY');
+
+    const app = await createHttpServer(() => createTestMcpServer());
+    let status: number | undefined;
+    await captureConsoleOutput(async () => {
+      const res = await request(app)
+        .get('/health')
+        .set('X-Forwarded-For', '203.0.113.10');
+      status = res.status;
+    });
+
+    assert.equal(status, 200);
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('MCP_HTTP_TRUST_PROXY=true sets Express trust proxy to true', async () => {
+    envManager.set('MCP_HTTP_TRUST_PROXY', 'true');
+
+    const app = await createHttpServer(() => createTestMcpServer());
+    assert.equal(app.get('trust proxy'), true);
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('MCP_HTTP_TRUST_PROXY=1 sets Express trust proxy to one hop', async () => {
+    envManager.set('MCP_HTTP_TRUST_PROXY', '1');
+
+    const app = await createHttpServer(() => createTestMcpServer());
+    assert.equal(app.get('trust proxy'), 1);
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('MCP_HTTP_TRUST_PROXY subnet value passes through to Express', async () => {
+    envManager.set('MCP_HTTP_TRUST_PROXY', '10.0.0.0/8');
+
+    const app = await createHttpServer(() => createTestMcpServer());
+    assert.equal(app.get('trust proxy'), '10.0.0.0/8');
+
+    envManager.restore();
+  }, results);
 
   await testFunction('GET /health returns healthy status', async () => {
     const app = await createHttpServer(() => createTestMcpServer());
@@ -38,32 +2109,1002 @@ async function runTests() {
     assert.equal(res.body.server, 'local/deep-re-searxng');
   }, results);
 
-  await testFunction('GET /health includes CORS headers', async () => {
-    const app = await createHttpServer(() => createTestMcpServer());
-    const res = await request(app)
-      .get('/health')
-      .set('Origin', 'http://example.com');
+  await testFunction('origin boundary rejects every present invalid Origin before parsers, CORS, limits, auth, or server construction', async () => {
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_AUTH_TOKEN');
+    envManager.delete('MCP_HTTP_ALLOWED_ORIGINS');
+    envManager.delete('MCP_HTTP_STATELESS');
+    envManager.set('MCP_RATE_INIT_MAX', '1');
+    let constructions = 0;
 
-    assert.equal(res.status, 200);
-    assert.ok(res.headers['access-control-allow-origin']);
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        return createTestMcpServer();
+      }, 43123);
+      const expected = {
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Invalid Origin header' },
+        id: null,
+      };
+      const invalidOrigins = [
+        'null',
+        'not an origin',
+        'http://localhost:43123,http://127.0.0.1:43123',
+        'HTTP://localhost:43123',
+        'http://localhost:43123/',
+        '',
+      ];
+      const responses = await captureConsoleOutput(async () => {
+        const methodResponses = await Promise.all([
+          request(app).options('/MCP')
+            .set('Origin', invalidOrigins[0])
+            .set('Access-Control-Request-Method', 'POST'),
+          request(app).post('/mcp/')
+            .set('Origin', invalidOrigins[1])
+            .set('Content-Type', 'application/json')
+            .send('{"jsonrpc":"2.0"'),
+          request(app).get('/mcp/anything').set('Origin', invalidOrigins[2]),
+          request(app).delete('/mcp').set('Origin', invalidOrigins[3]),
+          request(app).patch('/mcp').set('Origin', invalidOrigins[4]),
+          request(app).post('/mcp').set('Origin', invalidOrigins[5]),
+        ]);
+        for (const res of methodResponses) {
+          assert.equal(res.status, 403);
+          assert.deepEqual(res.body, expected);
+          assert.equal(res.headers['access-control-allow-origin'], undefined);
+          assert.equal(res.headers['ratelimit-limit'], undefined);
+          assert.equal(res.headers['ratelimit-remaining'], undefined);
+          assert.ok(!Object.keys(res.headers).some(header => /rate-?limit/i.test(header)));
+        }
+
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const res = await request(app).post('/mcp').set('Origin', 'https://attacker.example');
+          assert.equal(res.status, 403);
+          assert.deepEqual(res.body, expected);
+          assert.equal(res.headers['ratelimit-limit'], undefined);
+        }
+      });
+      assert.deepEqual(responses, []);
+      assert.equal(constructions, 0);
+
+      const outside = await request(app).post('/mcp-extra')
+        .set('Origin', 'https://attacker.example');
+      assert.equal(outside.status, 404);
+    } finally {
+      envManager.restore();
+    }
   }, results);
 
-  await testFunction('CORS allows expected headers', async () => {
-    const app = await createHttpServer(() => createTestMcpServer());
-    const res = await request(app)
-      .options('/mcp')
-      .set('Origin', 'http://example.com')
-      .set('Access-Control-Request-Method', 'POST')
-      .set('Access-Control-Request-Headers', 'Content-Type, mcp-session-id, authorization, mcp-protocol-version');
+  await testFunction('stateless origin boundary rejects attacker Origins before construction in compatibility mode', async () => {
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOWED_ORIGINS');
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    let constructions = 0;
 
-    assert.equal(res.status, 204, 'OPTIONS preflight should succeed');
-    const allowHeaders = (res.headers['access-control-allow-headers'] || '').toLowerCase();
-    const expected = ['content-type', 'mcp-session-id', 'authorization', 'mcp-protocol-version'];
-    for (const header of expected) {
-      assert.ok(
-        allowHeaders.includes(header),
-        `Expected '${header}' in Access-Control-Allow-Headers, got: ${allowHeaders}`
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        return createTestMcpServer();
+      }, 43123);
+      const res = await request(app).post('/mcp')
+        .set('Origin', 'https://attacker.example')
+        .set('Content-Type', 'application/json')
+        .send('{"jsonrpc":"2.0"');
+      assert.equal(res.status, 403);
+      assert.deepEqual(res.body, {
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Invalid Origin header' },
+        id: null,
+      });
+      assert.equal(constructions, 0);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('origin boundary permits absent Origins and reflects only exact allowed Origins', async () => {
+    envManager.delete('MCP_HTTP_HARDEN');
+    envManager.delete('MCP_HTTP_ALLOWED_ORIGINS');
+
+    try {
+      const app = await createHttpServer(() => createTestMcpServer(), 43123);
+      const allowedOrigins = [
+        'http://127.0.0.1',
+        'http://localhost',
+        'http://[::1]',
+        'https://127.0.0.1',
+        'https://localhost',
+        'https://[::1]',
+        'http://127.0.0.1:43123',
+        'http://localhost:43123',
+        'http://[::1]:43123',
+        'https://127.0.0.1:43123',
+        'https://localhost:43123',
+        'https://[::1]:43123',
+      ];
+      for (const allowedOrigin of allowedOrigins) {
+        await assertAllowedMcpPreflight(app, allowedOrigin);
+      }
+
+      const post = await request(app).post('/mcp')
+        .set('Origin', 'http://localhost:43123')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({
+          jsonrpc: '2.0', id: 1, method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'origin-test', version: '1.0.0' } },
+        });
+      assert.equal(post.status, 200);
+      assert.equal(post.headers['access-control-allow-origin'], 'http://localhost:43123');
+      assert.match(post.headers.vary || '', /Origin/);
+
+      const absent = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({
+          jsonrpc: '2.0', id: 2, method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'no-origin-test', version: '1.0.0' } },
+        });
+      assert.equal(absent.status, 200);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('explicit origins replace loopback defaults and invalid Origin wins over hardened authentication', async () => {
+    envManager.set('MCP_HTTP_ALLOWED_ORIGINS', 'https://app.example.com');
+
+    try {
+      const explicitApp = await createHttpServer(() => createTestMcpServer(), 43123);
+      const loopback = await request(explicitApp).post('/mcp')
+        .set('Origin', 'http://localhost:43123');
+      assert.equal(loopback.status, 403);
+      const explicitOptions = await request(explicitApp).options('/mcp')
+        .set('Origin', 'https://app.example.com')
+        .set('Access-Control-Request-Method', 'POST');
+      assert.equal(explicitOptions.status, 204);
+      assert.equal(explicitOptions.headers['access-control-allow-origin'], 'https://app.example.com');
+      assert.match(explicitOptions.headers.vary || '', /Origin/);
+
+      const explicitPost = await request(explicitApp).post('/mcp')
+        .set('Origin', 'https://app.example.com')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({
+          jsonrpc: '2.0', id: 1, method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'explicit-origin-test', version: '1.0.0' } },
+        });
+      assert.equal(explicitPost.status, 200);
+      assert.equal(explicitPost.headers['access-control-allow-origin'], 'https://app.example.com');
+      assert.match(explicitPost.headers.vary || '', /Origin/);
+
+      envManager.set('MCP_HTTP_HARDEN', 'true');
+      envManager.set('MCP_HTTP_AUTH_TOKEN', 'secret-token');
+      const hardenedApp = await createHttpServer(() => createTestMcpServer());
+      for (const authorization of [undefined, 'Bearer wrong-token']) {
+        const invalidOrigin = await request(hardenedApp).post('/mcp')
+          .set('Origin', 'https://attacker.example')
+          .set('Content-Type', 'application/json')
+          .set(authorization === undefined ? {} : { Authorization: authorization })
+          .send('{"jsonrpc":"2.0"');
+        assert.equal(invalidOrigin.status, 403);
+        assert.deepEqual(invalidOrigin.body, {
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Invalid Origin header' },
+          id: null,
+        });
+      }
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('hardened mode keeps GET /health unauthenticated with fixed metadata', async () => {
+    envManager.set('MCP_HTTP_HARDEN', 'true');
+    envManager.set('MCP_HTTP_AUTH_TOKEN', 'secret-token');
+    envManager.set('MCP_HTTP_ALLOWED_ORIGINS', 'https://app.example.com');
+
+    try {
+      const app = await createHttpServer(() => createTestMcpServer(), 3000);
+      const res = await request(app)
+        .get('/health')
+        .set('Origin', 'https://unlisted.example.com')
+        .set('Host', 'unlisted.example.com');
+
+      assert.equal(res.status, 200);
+      assert.deepEqual(
+        Object.keys(res.body).sort(),
+        ['server', 'status', 'transport', 'version'],
       );
+      assert.equal(res.body.status, 'healthy');
+      assert.equal(res.body.server, 'local/deep-re-searxng');
+      assert.equal(res.body.transport, 'http');
+      assert.equal(typeof res.body.version, 'string');
+      assert.equal(res.headers['access-control-allow-origin'], undefined);
+      assert.match(res.headers.vary || '', /Origin/);
+
+      const allowedHealth = await request(app)
+        .get('/health')
+        .set('Origin', 'https://app.example.com');
+      assert.equal(allowedHealth.status, 200);
+      assert.equal(allowedHealth.headers['access-control-allow-origin'], 'https://app.example.com');
+      assert.match(allowedHealth.headers.vary || '', /Origin/);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('hardened stateful GET and DELETE reject disallowed Host values', async () => {
+    envManager.set('MCP_HTTP_HARDEN', 'true');
+    envManager.set('MCP_HTTP_AUTH_TOKEN', 'stateful-host-test-token');
+    envManager.set('MCP_HTTP_ALLOWED_ORIGINS', 'https://client.example');
+    envManager.set('MCP_HTTP_ALLOWED_HOSTS', 'allowed.example');
+
+    try {
+      const app = await createHttpServer(() => createTestMcpServer());
+      const expected = {
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Invalid Host header' },
+        id: null,
+      };
+      for (const method of ['get', 'delete'] as const) {
+        const response = await request(app)[method]('/mcp')
+          .set('Authorization', 'Bearer stateful-host-test-token')
+          .set('Host', 'attacker.example');
+        assert.equal(response.status, 403);
+        assert.deepEqual(response.body, expected);
+      }
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+
+  await testFunction('stateless POST limiter selection uses the request body and ignores session headers', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_RATE_INIT_MAX', '7');
+    envManager.set('MCP_RATE_SESSION_MAX', '11');
+    envManager.set('MCP_RATE_WINDOW_MS', '60000');
+
+    try {
+      const app = await createHttpServer(() => createTestMcpServer());
+      const initRes = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .set('mcp-session-id', 'stale-session')
+        .send({
+          jsonrpc: '2.0', id: 1, method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {},
+            clientInfo: { name: 'stateless-client', version: '1.0.0' } }
+        });
+      assert.equal(initRes.status, 200);
+      assert.equal(initRes.headers['ratelimit-limit'], '7');
+      assert.equal(initRes.headers['mcp-session-id'], undefined);
+
+      const listRes = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .set('mcp-session-id', 'stale-session')
+        .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+      assert.equal(listRes.status, 200);
+      assert.equal(listRes.headers['ratelimit-limit'], '11');
+
+      const batchRes = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send([{ jsonrpc: '2.0', id: 3, method: 'initialize', params: {} }]);
+      assert.equal(batchRes.headers['ratelimit-limit'], '11');
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless hardened Host and Origin checks reject before server construction', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_HARDEN', 'true');
+    envManager.set('MCP_HTTP_AUTH_TOKEN', 'secret-token');
+    envManager.set('MCP_HTTP_ALLOWED_ORIGINS', 'https://allowed.example.com');
+    envManager.set('MCP_HTTP_ALLOWED_HOSTS', 'allowed.example.com');
+    let constructions = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        return createTestMcpServer();
+      });
+      const body = {
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {},
+          clientInfo: { name: 'security-client', version: '1.0.0' } }
+      };
+
+      const hostRes = await request(app)
+        .post('/mcp')
+        .set('Host', 'blocked.example.com')
+        .set('Origin', 'https://allowed.example.com')
+        .set('Authorization', 'Bearer secret-token')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send(body);
+      assert.equal(hostRes.status, 403);
+      assert.equal(constructions, 0);
+
+      const originRes = await request(app)
+        .post('/mcp')
+        .set('Host', 'allowed.example.com')
+        .set('Origin', 'https://blocked.example.com')
+        .set('Authorization', 'Bearer secret-token')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send(body);
+      assert.equal(originRes.status, 403);
+      assert.equal(constructions, 0);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless malformed and oversized JSON stop before server construction', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    let constructions = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        return createTestMcpServer();
+      });
+      const malformed = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .send('{"jsonrpc":"2.0"');
+      assert.ok(malformed.status >= 400);
+      assert.equal(constructions, 0);
+
+      const oversized = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .send({ payload: 'x'.repeat(101 * 1024) });
+      assert.ok(oversized.status >= 400);
+      assert.equal(constructions, 0);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless capacity enforces per-IP and global bounds without constructing rejected requests', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '2');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    envManager.set('MCP_HTTP_TRUST_PROXY', '1');
+    envManager.set('MCP_RATE_SESSION_MAX', '20');
+    const release = createDeferred();
+    const startedResolvers: Array<() => void> = [];
+    let constructions = 0;
+    let closes = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        const server = createTestMcpServer();
+        const originalClose = server.close.bind(server);
+        server.close = async () => {
+          closes += 1;
+          await originalClose();
+        };
+        server.server.setRequestHandler('tools/call', async () => {
+          startedResolvers.shift()?.();
+          await release.promise;
+          return { content: [{ type: 'text', text: 'released' }] };
+        });
+        return server;
+      });
+      const callBody = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'hold', arguments: {} } };
+      const waitForStart = () => new Promise<void>((resolve) => startedResolvers.push(resolve));
+
+      const firstStarted = waitForStart();
+      const first = postStatelessMcp(app, callBody, '198.51.100.10');
+      const firstResult = first.then(response => response);
+      await firstStarted;
+
+      const sameIp = await postStatelessMcp(app, callBody, '198.51.100.10')
+        .timeout({ deadline: 500 });
+      assert.equal(sameIp.status, 503);
+      assert.equal(sameIp.headers['retry-after'], '1');
+      assert.equal(sameIp.body.error.code, -32000);
+      assert.equal(sameIp.body.error.message, 'Server busy');
+      assert.equal(constructions, 1);
+
+      const secondStarted = waitForStart();
+      const second = postStatelessMcp(app, { ...callBody, id: 2 }, '198.51.100.11');
+      const secondResult = second.then(response => response);
+      await secondStarted;
+
+      const global = await postStatelessMcp(app, { ...callBody, id: 3 }, '198.51.100.12');
+      assert.equal(global.status, 503);
+      assert.equal(global.headers['retry-after'], '1');
+      assert.equal(constructions, 2);
+
+      release.resolve();
+      assert.equal((await firstResult).status, 200);
+      assert.equal((await secondResult).status, 200);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(closes, 2);
+
+      const afterCleanup = await postStatelessMcp(
+        app,
+        { jsonrpc: '2.0', id: 4, method: 'tools/list', params: {} },
+        '198.51.100.10',
+      );
+      assert.equal(afterCleanup.status, 200);
+      assert.equal(constructions, 3);
+    } finally {
+      release.resolve();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('modern handler capacity bounds live servers and returns to zero', async () => {
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '2');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '2');
+    envManager.set('MCP_HTTP_TRUST_PROXY', '1');
+    const release = createDeferred();
+    const startedResolvers: Array<() => void> = [];
+    let live = 0;
+    let peak = 0;
+    let constructions = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        live += 1;
+        peak = Math.max(peak, live);
+        const server = createTestMcpServer();
+        server.server.onclose = () => {
+          live -= 1;
+        };
+        server.server.setRequestHandler('tools/call', async () => {
+          startedResolvers.shift()?.();
+          await release.promise;
+          return { content: [{ type: 'text', text: 'released' }] };
+        });
+        return server;
+      });
+      const envelope = {
+        'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+        'io.modelcontextprotocol/clientCapabilities': {},
+      };
+      const body = (id: number) => ({
+        jsonrpc: '2.0', id, method: 'tools/call',
+        params: { _meta: envelope, name: 'hold', arguments: {} },
+      });
+      const postModern = (id: number, ip: string) => request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json')
+        .set('MCP-Protocol-Version', '2026-07-28')
+        .set('MCP-Method', 'tools/call')
+        .set('MCP-Name', 'hold')
+        .set('X-Forwarded-For', ip)
+        .send(body(id));
+      const waitForStart = () => new Promise<void>((resolve) => startedResolvers.push(resolve));
+
+      const firstStarted = waitForStart();
+      const first = postModern(1, '198.51.100.20').then(response => response);
+      await firstStarted;
+      const secondStarted = waitForStart();
+      const second = postModern(2, '198.51.100.21').then(response => response);
+      await secondStarted;
+      const rejected = await postModern(3, '198.51.100.22');
+      assert.equal(rejected.status, 503);
+      assert.equal(constructions, 2);
+      assert.equal(peak, 2);
+
+      release.resolve();
+      assert.equal((await first).status, 200);
+      assert.equal((await second).status, 200);
+      for (let attempt = 0; attempt < 50 && live !== 0; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal(live, 0);
+    } finally {
+      release.resolve();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('modern default-mode timeout returns 504 and restores capacity', async () => {
+    envManager.delete('MCP_HTTP_STATELESS');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    envManager.set('MCP_HTTP_STATELESS_REQUEST_TIMEOUT_MS', '1000');
+    const never = new Promise<void>(() => undefined);
+    let constructions = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        const server = createTestMcpServer();
+        if (constructions === 1) {
+          server.connect = async () => {
+            await never;
+          };
+        }
+        return server;
+      });
+      const modernBody = (id: number) => ({
+        jsonrpc: '2.0', id, method: 'tools/list',
+        params: {
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities': {},
+          },
+        },
+      });
+      const postModern = (id: number) => request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json')
+        .set('MCP-Protocol-Version', '2026-07-28')
+        .set('MCP-Method', 'tools/list')
+        .send(modernBody(id));
+
+      const timedOut = await postModern(1).timeout({ deadline: 2000 });
+      assert.equal(timedOut.status, 504);
+      assert.deepEqual(timedOut.body, {
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Stateless request timed out' },
+        id: null,
+      });
+
+      const recovered = await postModern(2);
+      assert.equal(recovered.status, 200);
+      assert.equal(constructions, 2);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless capacity rejections consume the selected rate-limit bucket', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    envManager.set('MCP_RATE_SESSION_MAX', '2');
+    const release = createDeferred();
+    const started = createDeferred();
+
+    try {
+      const app = await createHttpServer(() => {
+        const server = createTestMcpServer();
+        server.server.setRequestHandler('tools/call', async () => {
+          started.resolve();
+          await release.promise;
+          return { content: [{ type: 'text', text: 'released' }] };
+        });
+        return server;
+      });
+      const body = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'hold', arguments: {} } };
+      const firstResult = request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send(body)
+        .then(response => response);
+      await started.promise;
+
+      const busy = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ ...body, id: 2 });
+      assert.equal(busy.status, 503);
+
+      const rateLimited = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ ...body, id: 3 });
+      assert.equal(rateLimited.status, 429);
+      assert.equal(rateLimited.body.error.code, -32029);
+
+      release.resolve();
+      assert.equal((await firstResult).status, 200);
+    } finally {
+      release.resolve();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless capacity warnings aggregate to one per minute per process', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    envManager.set('MCP_RATE_SESSION_MAX', '10');
+    const release = createDeferred();
+    const started = createDeferred();
+
+    try {
+      const app = await createHttpServer(() => {
+        const server = createTestMcpServer();
+        server.server.setRequestHandler('tools/call', async () => {
+          started.resolve();
+          await release.promise;
+          return { content: [{ type: 'text', text: 'released' }] };
+        });
+        return server;
+      });
+      const body = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'hold', arguments: {} } };
+      const firstResult = request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send(body)
+        .then(response => response);
+      await started.promise;
+
+      const output = await captureConsoleOutput(async () => {
+        for (let id = 2; id <= 4; id += 1) {
+          const busy = await request(app).post('/mcp')
+            .set('Content-Type', 'application/json')
+            .set('Accept', 'application/json, text/event-stream')
+            .send({ ...body, id });
+          assert.equal(busy.status, 503);
+        }
+      });
+      assert.equal(output.filter(line => line.includes('Stateless HTTP capacity exhausted')).length, 1);
+
+      release.resolve();
+      assert.equal((await firstResult).status, 200);
+    } finally {
+      release.resolve();
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless request timeout returns the exact 504 contract and restores capacity', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    envManager.set('MCP_HTTP_STATELESS_REQUEST_TIMEOUT_MS', '1000');
+    const never = new Promise<void>(() => undefined);
+    let constructions = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        const server = createTestMcpServer();
+        if (constructions === 1) {
+          server.connect = async () => {
+            await never;
+          };
+        }
+        return server;
+      });
+      const timedOut = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'hold', arguments: {} } })
+        .timeout({ deadline: 2000 });
+      assert.equal(timedOut.status, 504);
+      assert.equal(timedOut.headers['retry-after'], undefined);
+      assert.deepEqual(timedOut.body, {
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'Stateless request timed out' },
+        id: null,
+      });
+
+      const afterTimeout = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+      assert.equal(afterTimeout.status, 200);
+      assert.equal(constructions, 2);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless lifetime includes synchronous server construction time', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    envManager.set('MCP_HTTP_STATELESS_REQUEST_TIMEOUT_MS', '1000');
+    let constructions = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        if (constructions === 1) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1050);
+        }
+        return createTestMcpServer();
+      });
+      const timedOut = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+      assert.equal(timedOut.status, 504);
+      assert.equal(timedOut.body.error.message, 'Stateless request timed out');
+
+      const recovered = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+      assert.equal(recovered.status, 200);
+      assert.equal(constructions, 2);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless timeout closes an already-started POST stream and restores capacity', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    envManager.set('MCP_HTTP_STATELESS_REQUEST_TIMEOUT_MS', '1000');
+    let constructions = 0;
+    let abortObserved = false;
+    let closes = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        const server = createTestMcpServer();
+        if (constructions === 1) {
+          const originalClose = server.close.bind(server);
+          server.close = async () => {
+            closes += 1;
+            await originalClose();
+          };
+          server.server.setRequestHandler('tools/call', async (_request, extra) => {
+            await new Promise<void>((resolve) => {
+              if (extra.mcpReq.signal.aborted) {
+                abortObserved = true;
+                resolve();
+                return;
+              }
+              extra.mcpReq.signal.addEventListener('abort', () => {
+                abortObserved = true;
+                resolve();
+              }, { once: true });
+            });
+            return { content: [{ type: 'text', text: 'aborted' }] };
+          });
+        }
+        return server;
+      });
+      let streamError = '';
+      let timeoutResponse: request.Response | undefined;
+      try {
+        timeoutResponse = await request(app).post('/mcp')
+          .set('Content-Type', 'application/json')
+          .set('Accept', 'application/json, text/event-stream')
+          .send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'hold', arguments: {} } })
+          .timeout({ deadline: 2000 });
+      } catch (error) {
+        streamError = error instanceof Error ? error.message : String(error);
+      }
+      if (timeoutResponse) {
+        if (timeoutResponse.status === 504) {
+          assert.deepEqual(timeoutResponse.body, {
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Stateless request timed out' },
+            id: null,
+          });
+        } else {
+          assert.equal(timeoutResponse.status, 200);
+          assert.doesNotMatch(timeoutResponse.text, /"(?:result|error)"\s*:/);
+          const stream = timeoutResponse.res as { complete?: boolean; aborted?: boolean; destroyed?: boolean };
+          assert.ok(stream.complete === false || stream.aborted === true || stream.destroyed === true);
+        }
+      } else {
+        assert.match(streamError, /aborted|socket hang up/i);
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(abortObserved, true);
+      assert.equal(closes, 1);
+
+      const afterTimeout = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+      assert.equal(afterTimeout.status, 200);
+      assert.equal(constructions, 2);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless construction failures restore capacity', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    let constructions = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        if (constructions === 1) throw new Error('controlled construction failure');
+        return createTestMcpServer();
+      });
+      const failed = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+      assert.equal(failed.status, 500);
+
+      const recovered = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+      assert.equal(recovered.status, 200);
+      assert.equal(constructions, 2);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless cleanup wait is bounded and reclaims capacity exactly once', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    envManager.set('MCP_RATE_SESSION_MAX', '20');
+    const closeStarted = createDeferred();
+    const never = new Promise<void>(() => undefined);
+    let constructions = 0;
+    let closeAttempts = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        const server = createTestMcpServer();
+        if (constructions === 1) {
+          server.close = async () => {
+            closeAttempts += 1;
+            closeStarted.resolve();
+            await never;
+          };
+        }
+        return server;
+      });
+      const first = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+      assert.equal(first.status, 200);
+      await closeStarted.promise;
+
+      const busy = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+      assert.equal(busy.status, 503);
+      await new Promise(resolve => setTimeout(resolve, 5300));
+
+      const recovered = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} });
+      assert.equal(recovered.status, 200);
+      assert.equal(constructions, 2);
+      assert.equal(closeAttempts, 1);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless client disconnect aborts handler work and restores capacity', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT', '1');
+    envManager.set('MCP_HTTP_STATELESS_MAX_IN_FLIGHT_PER_IP', '1');
+    const handlerStarted = createDeferred();
+    const handlerAborted = createDeferred();
+    let constructions = 0;
+    let closes = 0;
+
+    try {
+      const app = await createHttpServer(() => {
+        constructions += 1;
+        const server = createTestMcpServer();
+        if (constructions === 1) {
+          const originalClose = server.close.bind(server);
+          server.close = async () => {
+            closes += 1;
+            await originalClose();
+          };
+          server.server.setRequestHandler('tools/call', async (_request, extra) => {
+            handlerStarted.resolve();
+            await new Promise<void>((resolve) => {
+              extra.mcpReq.signal.addEventListener('abort', () => {
+                handlerAborted.resolve();
+                resolve();
+              }, { once: true });
+            });
+            return { content: [{ type: 'text', text: 'aborted' }] };
+          });
+        }
+        return server;
+      });
+      const pending = request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'hold', arguments: {} } });
+      const pendingResult = pending.then(
+        response => response,
+        error => error,
+      );
+      await handlerStarted.promise;
+      pending.abort();
+      await handlerAborted.promise;
+      await pendingResult;
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      const recovered = await request(app).post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+      assert.equal(recovered.status, 200);
+      assert.equal(constructions, 2);
+      assert.equal(closes, 1);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless GET and DELETE keep the session limiter and return the exact 405 contract', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_RATE_SESSION_MAX', '2');
+    envManager.set('MCP_RATE_WINDOW_MS', '60000');
+
+    try {
+      const app = await createHttpServer(() => createTestMcpServer());
+      for (const method of ['get', 'delete'] as const) {
+        const res = await request(app)[method]('/mcp');
+        assert.equal(res.status, 405);
+        assert.equal(res.headers.allow, 'POST');
+        assert.equal(res.headers['ratelimit-limit'], '2');
+        assert.deepEqual(res.body, {
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Method not allowed' },
+          id: null,
+        });
+      }
+
+      const blocked = await request(app).get('/mcp');
+      assert.equal(blocked.status, 429);
+      assert.equal(blocked.body.error.code, -32029);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('stateless GET rejects unauthorized and invalid hardened headers before 405', async () => {
+    envManager.set('MCP_HTTP_STATELESS', 'true');
+    envManager.set('MCP_HTTP_HARDEN', 'true');
+    envManager.set('MCP_HTTP_AUTH_TOKEN', 'secret-token');
+    envManager.set('MCP_HTTP_ALLOWED_ORIGINS', 'https://allowed.example.com');
+    envManager.set('MCP_HTTP_ALLOWED_HOSTS', 'allowed.example.com');
+
+    try {
+      const app = await createHttpServer(() => createTestMcpServer());
+      const unauthorized = await request(app)
+        .get('/mcp')
+        .set('Host', 'allowed.example.com')
+        .set('Origin', 'https://allowed.example.com');
+      assert.equal(unauthorized.status, 401);
+
+      const invalidHost = await request(app)
+        .get('/mcp')
+        .set('Host', 'blocked.example.com')
+        .set('Origin', 'https://allowed.example.com')
+        .set('Authorization', 'Bearer secret-token');
+      assert.equal(invalidHost.status, 403);
+
+      const invalidOrigin = await request(app)
+        .delete('/mcp')
+        .set('Host', 'allowed.example.com')
+        .set('Origin', 'https://blocked.example.com')
+        .set('Authorization', 'Bearer secret-token');
+      assert.equal(invalidOrigin.status, 403);
+    } finally {
+      envManager.restore();
     }
   }, results);
 
@@ -79,9 +3120,18 @@ async function runTests() {
     assert.equal(res.body.jsonrpc, '2.0');
     assert.ok(res.body.error);
     assert.equal(res.body.error.code, -32000);
+    assert.equal(res.body.error.message, 'Bad Request: No valid session ID provided');
+
+    const blank = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('mcp-session-id', ' ')
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 2 });
+    assert.equal(blank.status, 400);
+    assert.equal(blank.body.error.code, -32000);
   }, results);
 
-  await testFunction('POST /mcp with unknown sessionId and non-initialize body returns 400', async () => {
+  await testFunction('POST /mcp with unknown sessionId and non-initialize body returns 404 Session not found', async () => {
     const app = await createHttpServer(() => createTestMcpServer());
 
     const res = await request(app)
@@ -90,8 +3140,11 @@ async function runTests() {
       .set('mcp-session-id', 'unknown-session-abc')
       .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
 
-    // mcp-session-id is set but transport not found — falls through to invalid request
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 404);
+    assert.equal(res.body.jsonrpc, '2.0');
+    assert.ok(res.body.error);
+    assert.equal(res.body.error.code, -32001);
+    assert.equal(res.body.error.message, 'Session not found');
   }, results);
 
   await testFunction('GET /mcp without sessionId returns 400', async () => {
@@ -100,18 +3153,24 @@ async function runTests() {
     const res = await request(app).get('/mcp');
 
     assert.equal(res.status, 400);
-    assert.ok(res.text.includes('Invalid or missing session ID'));
+    assert.equal(res.body.error.code, -32000);
+    assert.equal(res.body.error.message, 'Bad Request: No valid session ID provided');
+
+    const blank = await request(app).get('/mcp').set('mcp-session-id', ' ');
+    assert.equal(blank.status, 400);
+    assert.equal(blank.body.error.code, -32000);
   }, results);
 
-  await testFunction('GET /mcp with unknown sessionId returns 400', async () => {
+  await testFunction('GET /mcp with unknown sessionId returns 404', async () => {
     const app = await createHttpServer(() => createTestMcpServer());
 
     const res = await request(app)
       .get('/mcp')
       .set('mcp-session-id', 'nonexistent-session-xyz');
 
-    assert.equal(res.status, 400);
-    assert.ok(res.text.includes('Invalid or missing session ID'));
+    assert.equal(res.status, 404);
+    assert.equal(res.body.error.code, -32001);
+    assert.equal(res.body.error.message, 'Session not found');
   }, results);
 
   await testFunction('DELETE /mcp without sessionId returns 400', async () => {
@@ -120,18 +3179,24 @@ async function runTests() {
     const res = await request(app).delete('/mcp');
 
     assert.equal(res.status, 400);
-    assert.ok(res.text.includes('Invalid or missing session ID'));
+    assert.equal(res.body.error.code, -32000);
+    assert.equal(res.body.error.message, 'Bad Request: No valid session ID provided');
+
+    const blank = await request(app).delete('/mcp').set('mcp-session-id', ' ');
+    assert.equal(blank.status, 400);
+    assert.equal(blank.body.error.code, -32000);
   }, results);
 
-  await testFunction('DELETE /mcp with unknown sessionId returns 400', async () => {
+  await testFunction('DELETE /mcp with unknown sessionId returns 404', async () => {
     const app = await createHttpServer(() => createTestMcpServer());
 
     const res = await request(app)
       .delete('/mcp')
       .set('mcp-session-id', 'nonexistent-session-xyz');
 
-    assert.equal(res.status, 400);
-    assert.ok(res.text.includes('Invalid or missing session ID'));
+    assert.equal(res.status, 404);
+    assert.equal(res.body.error.code, -32001);
+    assert.equal(res.body.error.message, 'Session not found');
   }, results);
 
   await testFunction('POST /mcp with initialize request creates session', async () => {
@@ -154,7 +3219,73 @@ async function runTests() {
 
     // Should succeed (200) and return a session ID
     assert.equal(res.status, 200);
-    assert.ok(res.headers['mcp-session-id'], 'Expected mcp-session-id header in response');
+    const sessionId = res.headers['mcp-session-id'];
+    assert.ok(sessionId, 'Expected mcp-session-id header in response');
+    assert.match(sessionId, /^[\x21-\x7e]+$/);
+  }, results);
+
+  await testFunction('HTTP initialization failures redact response and stderr diagnostics', async () => {
+    envManager.set(
+      'SEARXNG_URL',
+      'https://connect-user:connect-secret@search.example.com',
+    );
+    resetDiagnosticSanitizerForTests();
+    initializeDiagnosticSanitizer();
+    const app = await createHttpServer(() => {
+      throw new Error('connect failed for connect-user:connect-secret');
+    });
+    let response: request.Response | undefined;
+    const output = await captureConsoleOutput(async () => {
+      response = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .send({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2024-11-05',
+            capabilities: {},
+            clientInfo: { name: 'test-client', version: '1.0.0' },
+          },
+        });
+    });
+
+    const combined = `${response?.text}\n${output.join('\n')}`;
+    assert.equal(response?.status, 500);
+    assert.ok(!combined.includes('connect-user'), combined);
+    assert.ok(!combined.includes('connect-secret'), combined);
+    resetDiagnosticSanitizerForTests();
+    envManager.restore();
+  }, results);
+
+  await testFunction('POST /mcp with stale sessionId and initialize request creates new session', async () => {
+    const app = await createHttpServer(() => createTestMcpServer());
+
+    const res = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .set('mcp-session-id', 'stale-session-abc')
+      .send({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'test-client', version: '1.0.0' }
+        }
+      });
+
+    assert.equal(res.status, 200);
+    assert.ok(res.headers['mcp-session-id'], 'Expected new mcp-session-id header in response');
+    assert.notEqual(
+      res.headers['mcp-session-id'],
+      'stale-session-abc',
+      'Server should mint a fresh session id, not echo the stale client-supplied one'
+    );
   }, results);
 
   await testFunction('compatibility mode still allows health and init flow', async () => {
@@ -205,7 +3336,101 @@ async function runTests() {
       });
 
     assert.equal(res.status, 401);
+    assert.equal(res.body.error.code, -32001);
     envManager.restore();
+  }, results);
+
+  await testFunction('hardened mode rejects the undocumented raw authorization token', async () => {
+    envManager.set('MCP_HTTP_HARDEN', 'true');
+    envManager.set('MCP_HTTP_AUTH_TOKEN', 'secret-token');
+    envManager.set('MCP_HTTP_ALLOWED_ORIGINS', 'https://app.example.com');
+
+    const app = await createHttpServer(() => createTestMcpServer());
+    const res = await request(app)
+      .post('/mcp')
+      .set('Origin', 'https://app.example.com')
+      .set('Authorization', 'secret-token')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'test-client', version: '1.0.0' }
+        }
+      });
+
+    envManager.restore();
+    assert.equal(res.status, 401);
+    assert.equal(res.body.error.code, -32001);
+  }, results);
+
+  await testFunction('hardened mode + valid bearer + default hosts + matching Host:port initializes (BUG-012 regression)', async () => {
+    envManager.set('MCP_HTTP_HARDEN', 'true');
+    envManager.set('MCP_HTTP_AUTH_TOKEN', 'secret-token');
+    envManager.set('MCP_HTTP_ALLOWED_ORIGINS', 'https://app.example.com');
+    envManager.delete('MCP_HTTP_ALLOWED_HOSTS'); // use the port-aware default
+
+    const app = await createHttpServer(() => createTestMcpServer(), 3000);
+    const res = await request(app)
+      .post('/mcp')
+      .set('Host', '127.0.0.1:3000')
+      .set('Origin', 'https://app.example.com')
+      .set('Authorization', 'Bearer secret-token')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'test-client', version: '1.0.0' }
+        }
+      });
+
+    // Restore before asserting so a failure cannot leak MCP_HTTP_* into later tests.
+    envManager.restore();
+    assert.equal(res.status, 200);
+    assert.ok(res.headers['mcp-session-id'], 'Expected mcp-session-id header on a successful hardened init');
+  }, results);
+
+  await testFunction('hardened mode rejects a Host not in MCP_HTTP_ALLOWED_HOSTS with 403', async () => {
+    envManager.set('MCP_HTTP_HARDEN', 'true');
+    envManager.set('MCP_HTTP_AUTH_TOKEN', 'secret-token');
+    envManager.set('MCP_HTTP_ALLOWED_ORIGINS', 'https://app.example.com');
+    envManager.set('MCP_HTTP_ALLOWED_HOSTS', 'allowed.example.com');
+
+    const app = await createHttpServer(() => createTestMcpServer(), 3000);
+    const res = await request(app)
+      .post('/mcp')
+      .set('Host', 'evil.example.com') // explicit disallowed Host so the 403 is deterministic across supertest/node versions
+      .set('Origin', 'https://app.example.com')
+      .set('Authorization', 'Bearer secret-token')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'test-client', version: '1.0.0' }
+        }
+      });
+
+    envManager.restore();
+    assert.equal(res.status, 403);
+    assert.deepEqual(res.body, {
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Invalid Host header' },
+      id: null,
+    });
   }, results);
 
   await testFunction('multiple sessions can initialize without "Already connected" error', async () => {
@@ -255,6 +3480,66 @@ async function runTests() {
     assert.equal(listRes.status, 200, 'follow-up request should succeed on existing session');
   }, results);
 
+  await testFunction('stateful requests accept absent and supported protocol headers and reject unsupported versions', async () => {
+    const app = await createHttpServer(() => createTestMcpServer());
+    const initRes = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2025-11-25', capabilities: {},
+          clientInfo: { name: 'version-client', version: '1.0.0' } },
+      });
+    const sessionId = initRes.headers['mcp-session-id'];
+    assert.ok(sessionId);
+
+    const call = (id: number) => request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .set('mcp-session-id', sessionId)
+      .send({ jsonrpc: '2.0', id, method: 'tools/list', params: {} });
+
+    assert.equal((await call(2)).status, 200, 'absent version header must use the negotiated version');
+    assert.equal((await call(3).set('mcp-protocol-version', '2025-11-25')).status, 200);
+    const unsupported = await call(4).set('mcp-protocol-version', '2099-01-01');
+    assert.equal(unsupported.status, 400);
+    assert.equal(unsupported.body.error.code, -32602);
+  }, results);
+
+  await testFunction('unsupported protocol DELETE is rejected without terminating the session', async () => {
+    const app = await createHttpServer(() => createTestMcpServer());
+    const initRes = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2025-11-25', capabilities: {},
+          clientInfo: { name: 'delete-version-client', version: '1.0.0' } },
+      });
+    const sessionId = initRes.headers['mcp-session-id'];
+    assert.ok(sessionId);
+
+    const rejectedDelete = await request(app)
+      .delete('/mcp')
+      .set('mcp-session-id', sessionId)
+      .set('mcp-protocol-version', '2099-01-01');
+    assert.equal(rejectedDelete.status, 400);
+    assert.equal(rejectedDelete.body.error.code, -32602);
+
+    const stillLive = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .set('mcp-session-id', sessionId)
+      .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+    assert.equal(stillLive.status, 200);
+
+    assert.equal((await request(app).delete('/mcp').set('mcp-session-id', sessionId)).status, 204);
+  }, results);
+
   await testFunction('session cleanup: DELETE removes session so subsequent requests fail', async () => {
     const app = await createHttpServer(() => createTestMcpServer());
 
@@ -274,7 +3559,14 @@ async function runTests() {
     const deleteRes = await request(app)
       .delete('/mcp')
       .set('mcp-session-id', sessionId);
-    assert.equal(deleteRes.status, 200, 'DELETE should succeed for existing session');
+    assert.equal(deleteRes.status, 204, 'DELETE should succeed once with an empty response');
+    assert.equal(deleteRes.text, '');
+
+    const repeatedDelete = await request(app)
+      .delete('/mcp')
+      .set('mcp-session-id', sessionId);
+    assert.equal(repeatedDelete.status, 404, 'repeated DELETE should observe the terminated session');
+    assert.equal(repeatedDelete.body.error.code, -32001);
 
     const postRes = await request(app)
       .post('/mcp')
@@ -282,10 +3574,272 @@ async function runTests() {
       .set('Accept', 'application/json, text/event-stream')
       .set('mcp-session-id', sessionId)
       .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
-    assert.equal(postRes.status, 400, 'request after DELETE should be rejected');
+    assert.equal(postRes.status, 404, 'request after DELETE should be rejected');
+    assert.equal(postRes.body.error.code, -32001);
+    assert.equal(postRes.body.error.message, 'Session not found');
+  }, results);
+
+  await testFunction('failed session close remains tracked and permits a later termination retry', async () => {
+    await assertLifecycleEvents(async () => {
+    const app = await createHttpServer(() => createTestMcpServer());
+    const initRes = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {},
+          clientInfo: { name: 'close-retry-client', version: '1.0.0' } },
+      });
+    const sessionId = initRes.headers['mcp-session-id'];
+    assert.ok(sessionId);
+
+    const originalClose = NodeStreamableHTTPServerTransport.prototype.close;
+    let failNextClose = true;
+    NodeStreamableHTTPServerTransport.prototype.close = async function () {
+      if (failNextClose) {
+        failNextClose = false;
+        throw new Error('controlled close failure');
+      }
+      return originalClose.call(this);
+    };
+
+    try {
+      const failedDelete = await request(app).delete('/mcp').set('mcp-session-id', sessionId);
+      assert.equal(failedDelete.status, 500);
+
+      const stillLive = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .set('mcp-session-id', sessionId)
+        .send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+      assert.equal(stillLive.status, 200);
+      assert.equal((await request(app).delete('/mcp').set('mcp-session-id', sessionId)).status, 204);
+    } finally {
+      NodeStreamableHTTPServerTransport.prototype.close = originalClose;
+      await app.shutdownStateful();
+    }
+    }, { close_failure: 1 });
   }, results);
 
   // --- Rate Limiting ---
+
+  await testFunction('Rate limiting: production construction parses each configured variable once', async () => {
+    envManager.set('MCP_RATE_WINDOW_MS', '50ms');
+    envManager.set('MCP_RATE_INIT_MAX', '1e3');
+    envManager.set('MCP_RATE_SESSION_MAX', '0x10');
+
+    try {
+      const output = await captureConsoleOutput(async () => {
+        await createHttpServer(() => createTestMcpServer());
+      });
+      const warnings = output.filter(line => line.includes('Ignoring invalid MCP_RATE_'));
+
+      assert.deepEqual(warnings, [
+        '⚠️  Ignoring invalid MCP_RATE_WINDOW_MS. Expected a positive integer. Using default 60000.',
+        '⚠️  Ignoring invalid MCP_RATE_INIT_MAX. Expected a positive integer. Using default 20.',
+        '⚠️  Ignoring invalid MCP_RATE_SESSION_MAX. Expected a positive integer. Using default 300.',
+      ]);
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('Rate limiting: established-session POSTs use only the session limiter', async () => {
+    envManager.set('MCP_RATE_INIT_MAX', '2');
+    envManager.set('MCP_RATE_SESSION_MAX', '3');
+    envManager.set('MCP_RATE_WINDOW_MS', '60000');
+    const app = await createHttpServer(() => createTestMcpServer());
+
+    const initRes = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {},
+          clientInfo: { name: 'rate-limit-client', version: '1.0.0' } }
+      });
+    assert.equal(initRes.status, 200);
+    assert.equal(initRes.headers['ratelimit-limit'], '2');
+    const sessionId = initRes.headers['mcp-session-id'];
+    assert.ok(sessionId, 'initialize should return a session id');
+
+    for (let id = 2; id <= 4; id++) {
+      const res = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .set('mcp-session-id', sessionId)
+        .send({ jsonrpc: '2.0', id, method: 'tools/list', params: {} });
+      assert.equal(res.status, 200, `Established-session request ${id - 1} should succeed`);
+      assert.equal(res.headers['ratelimit-limit'], '3');
+    }
+
+    const blocked = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .set('mcp-session-id', sessionId)
+      .send({ jsonrpc: '2.0', id: 5, method: 'tools/list', params: {} });
+    envManager.restore();
+
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.headers['ratelimit-limit'], '3');
+    assert.equal(blocked.body.error.code, -32029);
+  }, results);
+
+  await testFunction('Rate limiting: modern POSTs cannot borrow a live legacy session bucket', async () => {
+    envManager.set('MCP_RATE_INIT_MAX', '3');
+    envManager.set('MCP_RATE_SESSION_MAX', '11');
+    envManager.set('MCP_RATE_WINDOW_MS', '60000');
+    const app = await createHttpServer((modern) => createMcpServer(new ToolAdmissionController({
+      rateWindowMs: 60_000,
+      rateMax: 100,
+      maxInFlight: 4,
+    }), modern));
+
+    const initRes = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .send({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {},
+          clientInfo: { name: 'rate-limit-era-client', version: '1.0.0' } }
+      });
+    const sessionId = initRes.headers['mcp-session-id'];
+    assert.equal(initRes.status, 200);
+    assert.ok(sessionId, 'legacy initialize should return a session id');
+
+    const modernBody = (id: number) => ({
+      jsonrpc: '2.0', id, method: 'server/discover',
+      params: {
+        _meta: {
+          'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+          'io.modelcontextprotocol/clientCapabilities': {},
+        },
+      },
+    });
+    const modernPost = (id: number) => request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json')
+      .set('MCP-Protocol-Version', '2026-07-28')
+      .set('MCP-Method', 'server/discover')
+      .set('mcp-session-id', sessionId)
+      .send(modernBody(id));
+
+    const accepted = await modernPost(2);
+    const unsupportedClaim = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json')
+      .set('mcp-session-id', sessionId)
+      .send({
+        jsonrpc: '2.0', id: 3, method: 'server/discover',
+        params: {
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2099-01-01',
+            'io.modelcontextprotocol/clientCapabilities': {},
+          },
+        },
+      });
+    const blocked = await modernPost(4);
+    envManager.restore();
+
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.headers['ratelimit-limit'], '3');
+    assert.notEqual(unsupportedClaim.status, 429);
+    assert.equal(unsupportedClaim.headers['ratelimit-limit'], '3');
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.headers['ratelimit-limit'], '3');
+    assert.equal(blocked.body.error.code, -32029);
+  }, results);
+
+  await testFunction('Rate limiting: non-live session identifiers use the init limiter', async () => {
+    envManager.set('MCP_RATE_INIT_MAX', '7');
+    envManager.set('MCP_RATE_SESSION_MAX', '11');
+    envManager.set('MCP_RATE_WINDOW_MS', '60000');
+    const app = await createHttpServer(() => createTestMcpServer());
+    const headers: Array<string | undefined> = [undefined, '', 'first, second'];
+
+    for (const sessionId of headers) {
+      let pending = request(app).post('/mcp').set('Content-Type', 'application/json');
+      if (sessionId !== undefined) pending = pending.set('mcp-session-id', sessionId);
+      const res = await pending.send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+      assert.equal(res.headers['ratelimit-limit'], '7');
+    }
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('Rate limiting: unknown-session POSTs exhaust the init limiter', async () => {
+    envManager.set('MCP_RATE_INIT_MAX', '2');
+    envManager.set('MCP_RATE_SESSION_MAX', '10');
+    envManager.set('MCP_RATE_WINDOW_MS', '60000');
+    const app = await createHttpServer(() => createTestMcpServer());
+
+    for (let id = 1; id <= 2; id++) {
+      const res = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('mcp-session-id', 'plausible-unknown-session')
+        .send({ jsonrpc: '2.0', method: 'tools/list', id });
+      assert.equal(res.status, 404);
+      assert.equal(res.headers['ratelimit-limit'], '2');
+    }
+
+    const blocked = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('mcp-session-id', 'plausible-unknown-session')
+      .send({ jsonrpc: '2.0', method: 'tools/list', id: 3 });
+    envManager.restore();
+
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.headers['ratelimit-limit'], '2');
+    assert.equal(blocked.body.error.code, -32029);
+  }, results);
+
+  await testFunction('Rate limiting: stale-header initialize stays on the init limiter', async () => {
+    envManager.set('MCP_RATE_INIT_MAX', '2');
+    envManager.set('MCP_RATE_SESSION_MAX', '10');
+    envManager.set('MCP_RATE_WINDOW_MS', '60000');
+    const app = await createHttpServer(() => createTestMcpServer());
+    const staleId = 'stale-session-id';
+    const initializeBody = (id: number) => ({
+      jsonrpc: '2.0', id, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {},
+        clientInfo: { name: 'stale-client', version: '1.0.0' } }
+    });
+
+    for (let id = 1; id <= 2; id++) {
+      const res = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', 'application/json, text/event-stream')
+        .set('mcp-session-id', staleId)
+        .send(initializeBody(id));
+      assert.equal(res.status, 200);
+      assert.equal(res.headers['ratelimit-limit'], '2');
+      assert.ok(res.headers['mcp-session-id']);
+      assert.notEqual(res.headers['mcp-session-id'], staleId);
+    }
+
+    const blocked = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', 'application/json, text/event-stream')
+      .set('mcp-session-id', staleId)
+      .send(initializeBody(3));
+    envManager.restore();
+
+    assert.equal(blocked.status, 429);
+    assert.equal(blocked.headers['ratelimit-limit'], '2');
+    assert.equal(blocked.body.error.code, -32029);
+  }, results);
 
   await testFunction('Rate limiting: POST /mcp returns 429 after exceeding initLimiter limit', async () => {
     envManager.set('MCP_RATE_INIT_MAX', '3');
@@ -309,6 +3863,26 @@ async function runTests() {
     assert.equal(res.body.error.code, -32029);
 
     envManager.restore();
+  }, results);
+
+  await testFunction('Rate limiting: invalid MCP_RATE_INIT_MAX falls back to default (does not fail open)', async () => {
+    // 'abc' has no leading digit → raw parseInt yields NaN → pre-fix the limiter
+    // was disabled (fail-open). With validation it falls back to the default of 20.
+    envManager.set('MCP_RATE_INIT_MAX', 'abc');
+    envManager.set('MCP_RATE_WINDOW_MS', '60000');
+    const app = await createHttpServer(() => createTestMcpServer());
+
+    let lastStatus = 0;
+    for (let i = 0; i < 21; i++) {
+      const res = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .send({ jsonrpc: '2.0', method: 'tools/list', id: i });
+      lastStatus = res.status;
+    }
+    // Restore env before asserting so a failed assertion can't leak MCP_RATE_* into later tests.
+    envManager.restore();
+    assert.equal(lastStatus, 429, 'limiter must stay active (default 20) on invalid input, not fail open');
   }, results);
 
   await testFunction('Rate limiting: GET /mcp returns 429 after exceeding sessionLimiter limit', async () => {
@@ -369,19 +3943,57 @@ async function runTests() {
     );
   }, results);
 
-  await testFunction('Rate limiting: RateLimit-* headers present on /health response', async () => {
-    const app = await createHttpServer(() => createTestMcpServer());
+  await testFunction('Rate limiting: /health keeps its independent fixed limit of 60', async () => {
+    envManager.set('MCP_RATE_WINDOW_MS', '120000');
+    envManager.set('MCP_RATE_INIT_MAX', '2');
+    envManager.set('MCP_RATE_SESSION_MAX', '3');
 
-    const res = await request(app).get('/health');
+    try {
+      const app = await createHttpServer(() => createTestMcpServer());
+      const res = await request(app).get('/health');
+      const limit = res.headers['ratelimit-limit'] || res.headers['x-ratelimit-limit'];
+      const remaining = res.headers['ratelimit-remaining'] || res.headers['x-ratelimit-remaining'];
 
+      assert.equal(limit, '60', 'health limit must remain fixed at 60 per minute');
+      assert.ok(remaining, 'RateLimit-Remaining header should be present on /health');
+    } finally {
+      envManager.restore();
+    }
+  }, results);
+
+  await testFunction('Rate limiting: trust proxy suppresses X-Forwarded-For validation warning', async () => {
+    envManager.delete('MCP_HTTP_TRUST_PROXY');
+
+    const defaultApp = await createHttpServer(() => createTestMcpServer());
+    const defaultOutput = await captureConsoleOutput(async () => {
+      await request(defaultApp)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('X-Forwarded-For', '203.0.113.10')
+        .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    });
     assert.ok(
-      res.headers['ratelimit-limit'] || res.headers['x-ratelimit-limit'],
-      'RateLimit-Limit header should be present on /health'
+      defaultOutput.some(line => line.includes('ERR_ERL_UNEXPECTED_X_FORWARDED_FOR')),
+      'negative control should emit express-rate-limit X-Forwarded-For validation warning'
     );
+
+    envManager.set('MCP_HTTP_TRUST_PROXY', 'true');
+
+    const trustedApp = await createHttpServer(() => createTestMcpServer());
+    const trustedOutput = await captureConsoleOutput(async () => {
+      await request(trustedApp)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('X-Forwarded-For', '203.0.113.10')
+        .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
+    });
+    assert.equal(trustedApp.get('trust proxy'), true);
     assert.ok(
-      res.headers['ratelimit-remaining'] || res.headers['x-ratelimit-remaining'],
-      'RateLimit-Remaining header should be present on /health'
+      !trustedOutput.some(line => line.includes('ERR_ERL_UNEXPECTED_X_FORWARDED_FOR')),
+      'trusted proxy should suppress express-rate-limit X-Forwarded-For validation warning'
     );
+
+    envManager.restore();
   }, results);
 
   await testFunction('Rate limiting: POST /mcp limit resets after window expires', async () => {

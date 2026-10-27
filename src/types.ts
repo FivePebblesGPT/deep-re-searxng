@@ -1,10 +1,10 @@
-import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { Tool } from "@modelcontextprotocol/server";
 
 export interface SearXNGWebResult {
   title: string;
   content: string;
   url: string;
-  score: number;
+  score?: number;
   engine?: string;
   engines?: string[];
   category?: string;
@@ -23,6 +23,7 @@ export interface SearXNGWeb {
   query: string;
   number_of_results: number;
   results: SearXNGWebResult[];
+  sourceFormat?: "json" | "html";
   suggestions?: string[];
   corrections?: string[];
   answers?: string[];
@@ -30,21 +31,26 @@ export interface SearXNGWeb {
   unresponsive_engines?: Array<[string, string]>;
 }
 
+export type ResultDetail = "compact" | "full";
+
 const VALID_TIME_RANGES = ["day", "week", "month", "year"] as const;
-const VALID_SAFESEARCH_VALUES = [0, 1, 2] as const;
+const VALID_SAFESEARCH_VALUES = [0, 1, 2, "0", "1", "2"] as const;
 const VALID_RESPONSE_FORMATS = ["text", "json"] as const;
+const VALID_RESULT_DETAILS = ["compact", "full"] as const;
 
 export function isSearXNGWebSearchArgs(args: unknown): args is {
   query: string;
   pageno?: number;
+  pages?: number;
   time_range?: string;
   language?: string;
-  safesearch?: number;
+  safesearch?: number | string;
   min_score?: number;
   num_results?: number;
   categories?: string;
   engines?: string;
   response_format?: "text" | "json";
+  result_detail?: ResultDetail;
 } {
   if (
     typeof args !== "object" ||
@@ -57,6 +63,7 @@ export function isSearXNGWebSearchArgs(args: unknown): args is {
 
   const searchArgs = args as {
     pageno?: unknown;
+    pages?: unknown;
     time_range?: unknown;
     language?: unknown;
     safesearch?: unknown;
@@ -65,11 +72,25 @@ export function isSearXNGWebSearchArgs(args: unknown): args is {
     categories?: unknown;
     engines?: unknown;
     response_format?: unknown;
+    result_detail?: unknown;
   };
 
-  if (searchArgs.pageno !== undefined && (typeof searchArgs.pageno !== "number" || searchArgs.pageno < 1)) {
+  if (
+    searchArgs.pageno !== undefined &&
+    (typeof searchArgs.pageno !== "number" || !Number.isInteger(searchArgs.pageno) || searchArgs.pageno < 1)
+  ) {
     return false;
   }
+  if (
+    searchArgs.result_detail !== undefined &&
+    (typeof searchArgs.result_detail !== "string" || !VALID_RESULT_DETAILS.includes(searchArgs.result_detail as any))
+  ) {
+    return false;
+  }
+  if (searchArgs.pages !== undefined &&
+    (typeof searchArgs.pages !== "number" || !Number.isInteger(searchArgs.pages) || searchArgs.pages < 1 || searchArgs.pages > 5)) return false;
+  if (typeof searchArgs.pages === "number" && searchArgs.pages > 1 &&
+    (!Number.isSafeInteger(searchArgs.pageno ?? 1) || Number(searchArgs.pageno ?? 1) > Number.MAX_SAFE_INTEGER - (searchArgs.pages - 1))) return false;
   if (
     searchArgs.time_range !== undefined &&
     (typeof searchArgs.time_range !== "string" || !VALID_TIME_RANGES.includes(searchArgs.time_range as any))
@@ -81,7 +102,8 @@ export function isSearXNGWebSearchArgs(args: unknown): args is {
   }
   if (
     searchArgs.safesearch !== undefined &&
-    (typeof searchArgs.safesearch !== "number" || !VALID_SAFESEARCH_VALUES.includes(searchArgs.safesearch as any))
+    ((typeof searchArgs.safesearch !== "number" && typeof searchArgs.safesearch !== "string") ||
+      !VALID_SAFESEARCH_VALUES.includes(searchArgs.safesearch as any))
   ) {
     return false;
   }
@@ -180,6 +202,7 @@ export const WEB_SEARCH_TOOL: Tool = {
     "CRITICAL: The required parameter name is exactly `query` (not `prompt`, `q`, or any other name). " +
     "Calls an external SearXNG instance; availability depends on the `SEARXNG_URL` configuration. " +
     "Use `pageno` to paginate results; combine `time_range` and `language` to narrow scope. " +
+    "When `engines` and `time_range` are both provided, every selected engine must explicitly advertise time-range support via SearXNG /config; otherwise the request is rejected before search. " +
     "To read the full text of a result URL, follow up with `web_url_read`.",
   annotations: {
     readOnlyHint: true,
@@ -194,13 +217,21 @@ export const WEB_SEARCH_TOOL: Tool = {
           "The search query string. This is the required parameter name — use exactly `query`, not `prompt` or `q`.",
       },
       pageno: {
-        type: "number",
+        type: "integer",
         description: "Search page number (starts at 1)",
+        minimum: 1,
+        default: 1,
+      },
+      pages: {
+        type: "integer",
+        description: "Fetch 1 to 5 consecutive pages concurrently starting at pageno; merge and deduplicate before applying the result limit. Failed pages are reported in failedPages in JSON output.",
+        minimum: 1,
+        maximum: 5,
         default: 1,
       },
       time_range: {
         type: "string",
-        description: "Time range of search (day, week, month, year)",
+        description: "Time range of search (day, week, month, year). With explicit engines, all selected engines must confirm time_range_support=true via /config.",
         enum: ["day", "week", "month", "year"],
       },
       language: {
@@ -210,11 +241,10 @@ export const WEB_SEARCH_TOOL: Tool = {
         default: "all",
       },
       safesearch: {
-        type: "number",
+        type: "string",
         description:
           "Safe search filter level (0: None, 1: Moderate, 2: Strict)",
-        enum: [0, 1, 2],
-        default: 0,
+        enum: ["0", "1", "2"],
       },
       min_score: {
         type: "number",
@@ -233,18 +263,22 @@ export const WEB_SEARCH_TOOL: Tool = {
       categories: {
         type: "string",
         description:
-          "Comma-separated SearXNG categories. Values are normalized case-insensitively to canonical names from live /config; unknown values are rejected with available categories listed. If /config is unavailable, values are forwarded as-is with a warning.",
+          "Comma-separated SearXNG categories. Live /config capabilities are aggregated across reachable instances; prefer searxng_instance_info categories.common for consistent multi-instance results. Values in categories.available are best-effort and may only be honored by some instances. Known values are normalized case-insensitively; unknown values are forwarded trimmed so SearXNG can ignore or honor them. If /config is unavailable, values are forwarded as-is with a warning. If omitted, each instance uses its server-side default.",
       },
       engines: {
         type: "string",
         description:
-          "Comma-separated SearXNG engine names to query (e.g. 'google,bing,ddg'). Values are normalized case-insensitively to canonical names from live /config; unknown values are rejected with available engines listed. If /config is unavailable, values are forwarded as-is with a warning.",
+          "Comma-separated SearXNG engine names to query (e.g. 'google,bing,ddg'). Live /config capabilities are aggregated across reachable instances; prefer searxng_instance_info engines.common.enabled for consistent multi-instance results. Values in engines.available.enabled are best-effort and may only be honored by some instances. Known values are normalized case-insensitively; unknown values are forwarded trimmed so SearXNG can ignore or honor them. If /config is unavailable, values are forwarded as-is with a warning. If omitted, each instance uses its server-side default.",
       },
       response_format: {
         type: "string",
-        description: "Response format: formatted text for agents or raw JSON for programmatic clients. Default: text.",
+        description: "Response format: formatted text for agents or raw JSON for programmatic clients. If omitted, SEARXNG_DEFAULT_RESPONSE_FORMAT applies; if unset or invalid, text is used. An explicit response_format always takes precedence.",
         enum: ["text", "json"],
-        default: "text",
+      },
+      result_detail: {
+        type: "string",
+        description: "Result detail: full preserves SearXNG metadata and search signals; compact returns only title, URL, and content-snippet fields for each result (JSON keys: title, url, content). If omitted, full is used.",
+        enum: ["compact", "full"],
       },
     },
     required: ["query"],
@@ -280,7 +314,7 @@ export const SUGGESTIONS_TOOL: Tool = {
 export const INSTANCE_INFO_TOOL: Tool = {
   name: "searxng_instance_info",
   description:
-    "Discovers capabilities from the configured SearXNG instance via /config, including categories, engines, defaults, locales, and plugins.",
+    "Discovers capabilities from all reachable configured SearXNG instances via /config, including categories.common/available, engines.common/available, defaults, locales, and plugins.",
   annotations: {
     readOnlyHint: true,
     openWorldHint: true,
@@ -344,7 +378,8 @@ export const LITE_INSTANCE_INFO_TOOL: Tool = {
 
 export const LITE_READ_URL_TOOL: Tool = {
   name: "web_url_read",
-  description: "Fetch URL. Returns page text as markdown.",
+  description:
+    "Fetch URL. Converts HTML to markdown; returns explicit JSON, plain text, YAML, TOML, and XML as readable markdown; supports bounded PDF text extraction; other binary/media/archive downloads are rejected. When browser solvers are configured, mcp-searxng attempts FlareSolverr first and then Byparr only after a busy or transient-unavailable acquisition; after a final busy or unavailable provider it uses one uncached direct read.",
   inputSchema: {
     type: "object",
     properties: { url: { type: "string", description: "URL to fetch." } },
@@ -355,7 +390,11 @@ export const LITE_READ_URL_TOOL: Tool = {
 export const READ_URL_TOOL: Tool = {
   name: "web_url_read",
   description:
-    "Fetches a URL and returns its text content converted to markdown. " +
+    "Fetches a URL and returns readable content as markdown. " +
+    "Content-type aware: HTML is converted to markdown; JSON is pretty-printed; plain text, YAML, TOML, and XML are returned as fenced readable text. " +
+    "PDF text extraction is supported with bounded input, output, page count, time, concurrency, and memory; OCR is not supported. " +
+    "Binary, media, archive, and octet-stream downloads other than PDFs are intentionally rejected instead of being returned as raw bytes. " +
+    "When the operator configures browser solvers, mcp-searxng attempts FlareSolverr first and then Byparr only after a busy or transient-unavailable acquisition; cache hits bypass acquisition and a final busy or unavailable provider uses one uncached direct-fetch fallback. " +
     "Three modes: " +
     "(1) Full content — omit filtering params; use `startChar`/`maxLength` to paginate large pages. " +
     "(2) Section extraction — set `section` to return content under a specific heading. " +

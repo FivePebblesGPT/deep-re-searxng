@@ -8,7 +8,14 @@
 
 import { strict as assert } from 'node:assert';
 import { fileURLToPath } from 'node:url';
-import { createProxyAgent, createDefaultAgent, ProxyType } from '../../src/proxy.js';
+import {
+  createProxyAgent,
+  createDefaultAgent,
+  applySearchRequestConfig,
+  fetchSearxng,
+  setSearxngFetchForTesting,
+  ProxyType,
+} from '../../src/proxy.js';
 import { testFunction, createTestResults, printTestSummary } from '../helpers/test-utils.js';
 import { EnvManager } from '../helpers/env-utils.js';
 
@@ -97,6 +104,33 @@ async function runTests() {
     }
     
     envManager.restore();
+  }, results);
+
+  await testFunction('Proxy configuration errors omit raw credentials before logging', () => {
+    for (const key of Object.keys(process.env).filter(key => /proxy$/i.test(key))) {
+      envManager.delete(key);
+    }
+    try {
+      for (const proxy of [
+        '//proxy-user:proxy-secret@proxy.example:8080',
+        'http://proxy-user:proxy-secret/suffix@proxy.example:8080',
+        'proxyuser:proxy-secret@proxy.example:8080',
+      ]) {
+        envManager.set('HTTP_PROXY', proxy);
+        assert.throws(() => createProxyAgent('http://example.com'), error => {
+          assert.ok(error instanceof Error);
+          assert.equal(error.constructor, Error);
+          assert.ok(!error.message.includes('proxy-user'), error.message);
+          assert.ok(!error.message.includes('proxyuser'), error.message);
+          assert.ok(!error.message.includes('proxy-secret'), error.message);
+          assert.match(error.message, /HTTP|http/);
+          return true;
+        });
+        assert.equal(process.env.HTTP_PROXY, proxy);
+      }
+    } finally {
+      envManager.restore();
+    }
   }, results);
 
   await testFunction('Different URL schemes', () => {
@@ -449,6 +483,113 @@ async function runTests() {
     assert.ok(agent, 'proxy agent should be created when HTTPS_PROXY is set and target is https');
     assert.equal(agent!.constructor.name, 'ProxyAgent');
 
+    envManager.restore();
+  }, results);
+
+  await testFunction('applySearchRequestConfig sets Basic Auth header when credentials are present', () => {
+    envManager.delete('AUTH_USERNAME');
+    envManager.delete('AUTH_PASSWORD');
+    envManager.delete('SEARCH_USER_AGENT');
+    envManager.delete('USER_AGENT');
+    envManager.set('AUTH_USERNAME', 'testuser');
+    envManager.set('AUTH_PASSWORD', 'testpass');
+
+    const requestOptions: RequestInit = {};
+    applySearchRequestConfig(requestOptions, 'https://searx.example.com/config');
+
+    const headers = (requestOptions.headers ?? {}) as Record<string, string>;
+    assert.ok(headers['authorization'], 'expected Authorization header');
+    assert.ok(headers['authorization'].startsWith('Basic '), 'expected Basic auth scheme');
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('applySearchRequestConfig omits Authorization when credentials are absent', () => {
+    envManager.delete('AUTH_USERNAME');
+    envManager.delete('AUTH_PASSWORD');
+    envManager.delete('SEARCH_USER_AGENT');
+    envManager.delete('USER_AGENT');
+
+    const requestOptions: RequestInit = {};
+    applySearchRequestConfig(requestOptions, 'https://searx.example.com/config');
+
+    const headers = (requestOptions.headers ?? {}) as Record<string, string>;
+    assert.equal(headers['authorization'], undefined, 'Authorization should be absent without credentials');
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('applySearchRequestConfig merges Authorization and User-Agent together', () => {
+    envManager.delete('AUTH_USERNAME');
+    envManager.delete('AUTH_PASSWORD');
+    envManager.delete('SEARCH_USER_AGENT');
+    envManager.delete('USER_AGENT');
+    envManager.set('AUTH_USERNAME', 'u');
+    envManager.set('AUTH_PASSWORD', 'p');
+    envManager.set('USER_AGENT', 'MyBot/1.0');
+
+    const requestOptions: RequestInit = {};
+    applySearchRequestConfig(requestOptions, 'https://searx.example.com/config');
+
+    const headers = (requestOptions.headers ?? {}) as Record<string, string>;
+    assert.ok(headers['authorization']?.startsWith('Basic '), 'Authorization should be set');
+    assert.equal(headers['user-agent'], 'MyBot/1.0', 'User-Agent should be set');
+
+    envManager.restore();
+  }, results);
+
+  await testFunction('fetchSearxng forwards requests through the configured implementation', async () => {
+    const expectedResponse = { ok: true, status: 200 } as Response;
+    let capturedInput: string | URL | Request | undefined;
+    let capturedOptions: RequestInit | undefined;
+
+    setSearxngFetchForTesting(async (input, options) => {
+      capturedInput = input;
+      capturedOptions = options;
+      return expectedResponse;
+    });
+
+    try {
+      const options: RequestInit = {
+        method: 'POST',
+        headers: { 'X-Test': 'forwarded' },
+      };
+      const response = await fetchSearxng('https://searx.example.com/search', options);
+
+      assert.equal(response, expectedResponse);
+      assert.equal(capturedInput, 'https://searx.example.com/search');
+      assert.equal(capturedOptions, options);
+    } finally {
+      setSearxngFetchForTesting();
+    }
+  }, results);
+
+  await testFunction('trusted solver endpoint ignores URL-reader-only proxy configuration', () => {
+    envManager.delete('HTTP_PROXY');
+    envManager.delete('HTTPS_PROXY');
+    envManager.delete('http_proxy');
+    envManager.delete('https_proxy');
+    envManager.set('URL_READER_HTTP_PROXY', 'http://reader-proxy:8080');
+
+    assert.equal(createProxyAgent('http://flaresolverr:8191'), undefined);
+    envManager.restore();
+  }, results);
+
+  await testFunction('trusted solver endpoint uses global proxy configuration', () => {
+    envManager.set('HTTP_PROXY', 'http://global-proxy:8080');
+
+    assert.equal(
+      createProxyAgent('http://flaresolverr:8191')?.constructor.name,
+      'ProxyAgent',
+    );
+    envManager.restore();
+  }, results);
+
+  await testFunction('trusted solver endpoint honors NO_PROXY', () => {
+    envManager.set('HTTP_PROXY', 'http://global-proxy:8080');
+    envManager.set('NO_PROXY', 'flaresolverr');
+
+    assert.equal(createProxyAgent('http://flaresolverr:8191'), undefined);
     envManager.restore();
   }, results);
 

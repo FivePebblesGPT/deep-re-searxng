@@ -90,6 +90,10 @@ export async function runTests(): Promise<TestResult> {
     assert.ok(output.includes('Validation passed: 1/1'), output);
   }, results);
 
+  await testFunction('research validator rejects vacuous and invalid coverage', () => {
+    execFileSync('python', ['__tests__/research/test_validate_json.py'], { cwd: repoRoot });
+  }, results);
+
   printTestSummary(results, 'Deep Research repo assets');
   return results;
 }

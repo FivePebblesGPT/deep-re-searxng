@@ -1,18 +1,28 @@
 #!/usr/bin/env node
 
-import { main } from "./index.js";
+import { handleUncaughtException, handleUnhandledRejection } from "./error-handler.js";
+import {
+  initializeDiagnosticSanitizer,
+  sanitizeErrorForTransport,
+} from "./diagnostic-sanitizer.js";
+import { writeDiagnostic } from "./diagnostic-output.js";
+import { packageVersion } from "./version.js";
 
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-  process.exit(1);
-});
+initializeDiagnosticSanitizer();
+process.on('uncaughtException', handleUncaughtException);
+process.on('unhandledRejection', handleUnhandledRejection);
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  process.exit(1);
-});
-
-main().catch((error) => {
-  console.error("Failed to start server:", error);
-  process.exit(1);
-});
+const args = process.argv.slice(2);
+if (args.length === 1 && (args[0] === "--version" || args[0] === "-v")) {
+  writeDiagnostic("log", packageVersion);
+} else if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
+  const { createCliHelpText } = await import("./resources.js");
+  writeDiagnostic("log", createCliHelpText());
+} else {
+  void import("./index.js")
+    .then(({ main }) => main())
+    .catch((error) => {
+      writeDiagnostic("error", "Failed to start server:", sanitizeErrorForTransport(error));
+      process.exit(1);
+    });
+}

@@ -4,6 +4,9 @@
  * Utilities for mocking fetch API in tests
  */
 
+import { searchCache } from '../../src/search-cache.js';
+import { setSearxngFetchForTesting } from '../../src/proxy.js';
+
 export type FetchMockOptions = {
   status?: number;
   statusText?: string;
@@ -31,12 +34,15 @@ export function createMockFetch(options: FetchMockOptions = {}) {
       throw throwError;
     }
 
-    return {
-      ok,
+    // Give consumers a real, readable body stream. Preserve the helper's
+    // historical json override for callers that deliberately pass both forms.
+    const response = new Response(body || (json !== null ? JSON.stringify(json) : ''), {
       status,
       statusText,
-      text: async () => body,
-      json: async () => {
+    });
+    Object.defineProperty(response, 'ok', { value: ok });
+    Object.defineProperty(response, 'json', {
+      value: async () => {
         if (json !== null) {
           return json;
         }
@@ -44,8 +50,9 @@ export function createMockFetch(options: FetchMockOptions = {}) {
           return JSON.parse(body);
         }
         throw new Error('No JSON content');
-      }
-    } as Response;
+      },
+    });
+    return response;
   };
 }
 
@@ -60,13 +67,10 @@ export function createCapturingMockFetch() {
     capturedUrl = url.toString();
     capturedOptions = options;
     
-    return {
-      ok: true,
+    return new Response(JSON.stringify({ results: [] }), {
       status: 200,
       statusText: 'OK',
-      text: async () => '<html><body>Test</body></html>',
-      json: async () => ({ results: [] })
-    } as Response;
+    });
   };
 
   return {
@@ -101,20 +105,15 @@ export function createAbortableMockFetch(delayMs: number = 50) {
 }
 
 /**
- * Save and restore global fetch
+ * Replace and restore the shared SearXNG fetch implementation
  */
 export class FetchMocker {
-  private originalFetch: typeof global.fetch;
-
-  constructor() {
-    this.originalFetch = global.fetch;
-  }
-
   mock(mockFetch: typeof global.fetch): void {
-    global.fetch = mockFetch;
+    setSearxngFetchForTesting(mockFetch);
   }
 
   restore(): void {
-    global.fetch = this.originalFetch;
+    setSearxngFetchForTesting();
+    searchCache.clear();
   }
 }
