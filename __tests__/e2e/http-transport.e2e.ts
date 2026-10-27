@@ -45,7 +45,7 @@ async function runTests() {
       server = await spawnHttpCli();
       assert.deepEqual(server.health, {
         status: 'healthy',
-        server: 'ihor-sokoliuk/mcp-searxng',
+        server: 'local/deep-re-searxng',
         version: packageVersion,
         transport: 'http',
       });
